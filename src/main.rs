@@ -57,7 +57,7 @@ async fn main() {
     // Market timing tracking
     let mut last_market_bucket = 0i64;
 
-    // reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n🏔️ Peak Range: 0.91-0.95 | Pullback: 0.03\n🛡️ SL Estricto: 0.67 | TP Global: 0.96\n♻️ Reciclaje: L3, L4, L5 (+0.06)").await;
+    reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n🏔️ Peak Range: 0.91-0.95 | Pullback: 0.03\n🛡️ SL Estricto: 0.67 | TP Global: 0.96\n♻️ Reciclaje: L3, L4, L5 (+0.06)").await;
 
     loop {
         match price_rx.recv().await {
