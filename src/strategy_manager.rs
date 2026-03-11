@@ -28,9 +28,9 @@ const RECYCLE_RANGE_LO: f64 = 0.68;
 /// Límite superior del rango de reciclaje
 const RECYCLE_RANGE_HI: f64 = 0.95;
 /// Stop Loss global estricto (todas las posiciones)
-const GLOBAL_SL: f64 = 0.67;
+const GLOBAL_SL: f64 = 0.67; // Usado solo como fallback
 /// Take Profit global
-const GLOBAL_TP: f64 = 0.97;
+const GLOBAL_TP: f64 = 0.98;
 /// Take Profit especial para compra 5 (índice 4)
 const BUY5_TP: f64 = 0.85;
 /// Ventana horaria de trading (hora UTC): 14:00 → 22:00
@@ -259,16 +259,16 @@ impl StrategyManager {
                 }
                 // -------------------
 
-                if token_ask >= 0.91 {
+                if token_ask >= 0.90 {
                     self.peak_detected = true;
                     if token_ask > self.max_observed_price {
                         self.max_observed_price = token_ask;
-                        info!("🏔️ DCA: Peak detected at {:.3} (Range: >= 0.91). Tracking pullback...", self.max_observed_price);
+                        info!("🏔️ DCA: Peak detected at {:.3} (Range: >= 0.90). Tracking pullback...", self.max_observed_price);
                     }
                 }
 
                 if self.peak_detected {
-                    let trigger_price = self.max_observed_price - 0.03;
+                    let trigger_price = self.max_observed_price - 0.02;
                     if token_ask <= trigger_price {
                         info!("🚀 TP/Pullback Triggered! Peak: {:.3} -> Target: {:.3} | Current: {:.3}", self.max_observed_price, trigger_price, token_ask);
                         let stake = self.base_stake;
@@ -282,11 +282,11 @@ impl StrategyManager {
                         if self.api.place_order(&self.current_token_id, token_ask, stake, "BUY").await {
                             // Actualizar los niveles de DCA dinámicamente según el precio de entrada real
                             self.levels[0].price = token_ask;
-                            self.levels[1].price = token_ask - 0.04;
-                            self.levels[2].price = token_ask - 0.08;
-                            self.levels[3].price = token_ask - 0.12;
-                            self.levels[4].price = token_ask - 0.16;
-                            self.levels[5].price = token_ask - 0.20;
+                            self.levels[1].price = token_ask - 0.03;
+                            self.levels[2].price = token_ask - 0.06;
+                            self.levels[3].price = token_ask - 0.09;
+                            self.levels[4].price = token_ask - 0.12;
+                            self.levels[5].price = token_ask - 0.15;
 
                             for i in 0..6 {
                                 if self.levels[i].can_recycle {
@@ -312,7 +312,7 @@ impl StrategyManager {
                                 • Stake: *${:.2}*\n\
                                 • TP: {:.2} | SL estricto: {:.2}\n\
                                 • Régimen: {:?} | σ: {:.2}%",
-                                self.max_observed_price, token_ask, self.side, stake, GLOBAL_TP, GLOBAL_SL, self.current_regime, vol_pct
+                                self.max_observed_price, token_ask, self.side, stake, GLOBAL_TP, self.levels[5].price - 0.06, self.current_regime, vol_pct
                             )).await;
                         }
                     }
@@ -325,14 +325,15 @@ impl StrategyManager {
             StrategyState::InPosition => {
 
                 // ── 1. STOP LOSS GLOBAL ESTRICTO ─────────────────────────
-                if token_bid <= GLOBAL_SL {
-                    warn!("🚨 STOP LOSS GLOBAL en {} ≤ {:.2} → Cerrando TODAS las posiciones!", token_bid, GLOBAL_SL);
+                let dynamic_sl = self.levels[5].price - 0.06;
+                if token_bid <= dynamic_sl {
+                    warn!("🚨 STOP LOSS GLOBAL en {} ≤ {:.2} → Cerrando TODAS las posiciones!", token_bid, dynamic_sl);
                     self.reporter.send_message(&format!(
                         "🚨 *STOP LOSS ESTRICTO*\n\
                         • Precio: *{:.3}*\n\
                         • SL: {:.2}\n\
                         • Cerrando TODAS las posiciones activas.",
-                        token_bid, GLOBAL_SL
+                        token_bid, dynamic_sl
                     )).await;
                     self.close_all_positions(token_bid, "SL-GLOBAL").await;
                     self.state = StrategyState::Finished;
@@ -486,8 +487,8 @@ impl StrategyManager {
                                     • Entrada: *{:.3}* (Lado: *{}*) {}\n\
                                     • Stake: *${:.2}*\n\
                                     • Avg. precio global: *{:.3}*\n\
-                                    • SL Estricto: 0.67",
-                                    i + 1, lvl_price, self.side, recycle_info, stake, self.average_price
+                                    • SL Estricto: {:.2}",
+                                    i + 1, lvl_price, self.side, recycle_info, stake, self.average_price, self.levels[5].price - 0.06
                                 )).await;
                             }
                         }
@@ -495,15 +496,16 @@ impl StrategyManager {
                 }
 
                 // ── 6. SL GARANTIZADO: re-chequeo post-DCA ─────────────────────────────
-                // Si compramos nuevos niveles y el precio SIGUE bajo 0.54,
+                // Si compramos nuevos niveles y el precio SIGUE bajo la línea de SL,
                 // el SL debe disparar de todas formas. Esto cubre flash crashes.
-                if token_bid <= GLOBAL_SL && self.total_amount > 0.0 {
-                    warn!("🚨 [SL-SAFETY] {:.3} <= {:.2} post-DCA — cerrando todo.", token_bid, GLOBAL_SL);
+                let dynamic_sl_safety = self.levels[5].price - 0.06;
+                if token_bid <= dynamic_sl_safety && self.total_amount > 0.0 {
+                    warn!("🚨 [SL-SAFETY] {:.3} <= {:.2} post-DCA — cerrando todo.", token_bid, dynamic_sl_safety);
                     self.reporter.send_message(&format!(
                         "🚨 *SL GARANTIZADO (post-crash)*\n\
-                        • Precio: *{:.3}* | SL: 0.67\n\
+                        • Precio: *{:.3}* | SL: {:.2}\n\
                         • Cerrando todas las posiciones activas.",
-                        token_bid
+                        token_bid, dynamic_sl_safety
                     )).await;
                     self.close_all_positions(token_bid, "SL-SAFETY").await;
                     self.state = StrategyState::Finished;
