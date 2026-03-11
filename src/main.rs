@@ -58,7 +58,7 @@ async fn main() {
     let mut last_market_bucket = 0i64;
     let mut cool_down_until: Option<chrono::DateTime<Utc>> = None;
 
-    reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n🏔️ Peak Range: 0.91-0.95 | Pullback: 0.03\n🛡️ SL Estricto: 0.67 | TP Global: 0.97\n♻️ Reciclaje: L3, L4, L5 (+0.06)").await;
+    reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n🏔️ Peak Range: 0.88-0.93 | Pullback: 0.02\n🛡️ SL: Dinámico (-0.06 de L6) | TP Global: 0.98\n♻️ Reciclaje: L3, L4, L5 (+0.06)").await;
 
     loop {
         match price_rx.recv().await {
@@ -251,8 +251,8 @@ async fn main() {
 
                         // 2. Token secundario (DOWN) — si DOWN empieza a formar pico, invertir roles
                         if let Some((bid, ask)) = strategy.api.get_market_price(&strategy.token_id_recovery).await {
-                            if ask >= 0.91 && ask <= 0.95 {
-                                info!("🔄 Pico 0.91-0.95 detectado en token DOWN. Invirtiendo roles...");
+                            if ask >= 0.88 && ask <= 0.93 {
+                                info!("🔄 Pico 0.88-0.93 detectado en token DOWN. Invirtiendo roles...");
                                 let old_main = strategy.token_id_main.clone();
                                 strategy.token_id_main = strategy.token_id_recovery.clone();
                                 strategy.token_id_recovery = old_main;

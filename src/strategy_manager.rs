@@ -259,11 +259,11 @@ impl StrategyManager {
                 }
                 // -------------------
 
-                if token_ask >= 0.90 {
+                if token_ask >= 0.88 && token_ask <= 0.93 {
                     self.peak_detected = true;
                     if token_ask > self.max_observed_price {
                         self.max_observed_price = token_ask;
-                        info!("🏔️ DCA: Peak detected at {:.3} (Range: >= 0.90). Tracking pullback...", self.max_observed_price);
+                        info!("🏔️ DCA: Peak detected at {:.3} (Range: 0.88-0.93). Tracking pullback...", self.max_observed_price);
                     }
                 }
 
