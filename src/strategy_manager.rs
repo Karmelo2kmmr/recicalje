@@ -241,19 +241,18 @@ impl StrategyManager {
                     return;
                 }
 
-                if token_ask >= 0.91 && token_ask <= 0.95 {
+                if token_ask >= 0.91 {
                     self.peak_detected = true;
                     if token_ask > self.max_observed_price {
                         self.max_observed_price = token_ask;
-                        if now.second() % 10 == 0 {
-                            info!("🏔️ DCA: Nuevo pico detectado: {:.3}", self.max_observed_price);
-                        }
+                        info!("🏔️ DCA: Peak detected at {:.3} (Range: >= 0.91). Tracking pullback...", self.max_observed_price);
                     }
                 }
 
                 if self.peak_detected {
                     let trigger_price = self.max_observed_price - 0.03;
                     if token_ask <= trigger_price {
+                        info!("🚀 TP/Pullback Triggered! Peak: {:.3} -> Target: {:.3} | Current: {:.3}", self.max_observed_price, trigger_price, token_ask);
                         let stake = self.base_stake;
                         let equity_now = equity_manager::compute_equity();
 
@@ -469,7 +468,7 @@ impl StrategyManager {
                                     • Entrada: *{:.3}* {}\n\
                                     • Stake: *${:.2}*\n\
                                     • Avg. precio global: *{:.3}*\n\
-                                    • SL: 0.54",
+                                    • SL Estricto: 0.67",
                                     i + 1, lvl_price, recycle_info, stake, self.average_price
                                 )).await;
                             }
@@ -481,10 +480,10 @@ impl StrategyManager {
                 // Si compramos nuevos niveles y el precio SIGUE bajo 0.54,
                 // el SL debe disparar de todas formas. Esto cubre flash crashes.
                 if token_bid <= GLOBAL_SL && self.total_amount > 0.0 {
-                    warn!("🚨 [SL-SAFETY] {:.3} < 0.54 post-DCA — cerrando todo.", token_bid);
+                    warn!("🚨 [SL-SAFETY] {:.3} <= {:.2} post-DCA — cerrando todo.", token_bid, GLOBAL_SL);
                     self.reporter.send_message(&format!(
                         "🚨 *SL GARANTIZADO (post-crash)*\n\
-                        • Precio: *{:.3}* | SL: 0.54\n\
+                        • Precio: *{:.3}* | SL: 0.67\n\
                         • Cerrando todas las posiciones activas.",
                         token_bid
                     )).await;

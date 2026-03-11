@@ -57,7 +57,7 @@ async fn main() {
     // Market timing tracking
     let mut last_market_bucket = 0i64;
 
-    reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n📊 Niveles: 0.83 → 0.79 → 0.75 → 0.71 → 0.67 → 0.63\n🛡️ SL: 0.54 | TP: 0.96 | ♻️ Reciclaje: 0.70–0.81").await;
+    reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n🏔️ Peak Range: 0.91-0.95 | Pullback: 0.03\n🛡️ SL Estricto: 0.67 | TP Global: 0.96\n♻️ Reciclaje: L3, L4, L5 (+0.06)").await;
 
     loop {
         match price_rx.recv().await {
@@ -200,11 +200,10 @@ async fn main() {
                     if strategy.state == StrategyState::Scanning {
                         if kill_switch_active { continue; }
 
-                        // Consultar ambos tokens, ejecutar tick en el que esté en zona 0.83
-                        // 1. Token principal (UP)
+                        // 1. Process Main Token (Initially UP, but flips to DOWN if peak found there first)
                         if let Some((bid, ask)) = strategy.api.get_market_price(&strategy.token_id_main).await {
                             strategy.current_token_id = strategy.token_id_main.clone();
-                            strategy.side = "UP".to_string();
+                            // strategy.side = strategy.main_side.clone(); // Ensure we use the persistent side
                             strategy.tick(bid, ask, current_vol_regime, current_btc_vol_pct, (_bucket_elapsed_ms / 1000) as u64, false).await;
                         }
 
