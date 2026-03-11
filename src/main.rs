@@ -239,7 +239,7 @@ async fn main() {
                 active_strategies.retain(|_, s| s.state != StrategyState::Finished);
 
                 // --- Reporting System (ET Time) ---
-                let et_offset = FixedOffset::west_opt(5 * 3600).unwrap();
+                let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
                 let now_et = Utc::now().with_timezone(&et_offset);
                 let hour = now_et.hour();
                 let minute = now_et.minute();

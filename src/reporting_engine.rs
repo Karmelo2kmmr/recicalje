@@ -26,7 +26,7 @@ pub struct ReportingEngine;
 impl ReportingEngine {
     /// Genera un reporte de estadísticas para las últimas `hours` horas con un `label` específico.
     pub async fn get_stats_report(api: &crate::polymarket_api::PolymarketAPI, hours: u32, label: &str) -> Option<String> {
-        let et_offset = FixedOffset::west_opt(5 * 3600).unwrap();
+        let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
         let now_et = Utc::now().with_timezone(&et_offset);
         let start_period = now_et - chrono::Duration::hours(hours as i64);
         

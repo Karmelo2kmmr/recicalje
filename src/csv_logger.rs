@@ -29,8 +29,8 @@ impl CSVLogger {
         equity_after: f64,
         volatility: &str,
     ) {
-        // New York is UTC-5
-        let et_offset = FixedOffset::west_opt(5 * 3600).unwrap();
+        // New York is UTC-4 (EDT)
+        let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
         let now_et = Utc::now().with_timezone(&et_offset);
         let time_str = now_et.format("%H:%M:%S").to_string();
         let date_str = now_et.format("%Y-%m-%d").to_string();
