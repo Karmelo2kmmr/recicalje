@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+/target_alpha/
+/target_final/
+/target_new/
+Cargo.lock
+
+# Variables de entorno - NUNCA subir al repo
+.env
+
+# Logs del bot
+bot_out.log
+bot_err.log
+bot_pid.txt
+
+# Trades history (datos privados)
+trades.csv
+trades_*.csv
+
+# Windows
+Thumbs.db
+desktop.ini

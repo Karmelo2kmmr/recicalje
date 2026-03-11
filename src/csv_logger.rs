@@ -1,0 +1,85 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use chrono::{Utc, FixedOffset};
+use log::error;
+
+#[derive(Clone)]
+pub struct CSVLogger;
+
+impl CSVLogger {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn log_trade(
+        &self,
+        coin: &str,
+        side: &str,
+        entry: f64,
+        exit: f64,
+        rez: &str,
+        status: &str,
+        pnl: f64,
+        ret_pct: f64,
+        strat: &str,
+        dca: u32,
+        market_id: &str,
+        equity_before: f64,
+        stake: f64,
+        equity_after: f64,
+        volatility: &str,
+    ) {
+        // New York is UTC-5
+        let et_offset = FixedOffset::west_opt(5 * 3600).unwrap();
+        let now_et = Utc::now().with_timezone(&et_offset);
+        let time_str = now_et.format("%H:%M:%S").to_string();
+        let date_str = now_et.format("%Y-%m-%d").to_string();
+        
+        let dated_filename = format!("trades_{}.csv", date_str);
+        let master_filename = "trades.csv".to_string();
+
+        let pnl_str = if pnl >= 0.0 {
+            format!("$+{:.2}", pnl)
+        } else {
+            format!("$-{:.2}", pnl.abs())
+        };
+
+        // Default AUDIT status is PENDING
+        let audit = "PENDING";
+
+        let row = format!(
+            "{:<10} | {:<5} | {:<4} | {:<6.3} | {:<6.3} | {:<3} | {:<20} | {:<8} | {:<6.1}% | {:<15} | {:<3} | {:<10} | {:<42} | ${:<8.2} | ${:<7.2} | ${:<8.2} | {}",
+            time_str, coin, side, entry, exit, rez, status, pnl_str, ret_pct, strat, dca, volatility, market_id,
+            equity_before, stake, equity_after, audit
+        );
+
+        // Write to both files
+        for filename in &[dated_filename, master_filename] {
+            // Ensure header exists
+            if !std::path::Path::new(filename).exists() {
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .append(true)
+                    .open(filename)
+                {
+                    let _ = writeln!(
+                        file,
+                        "TIME (ET) | COIN | SIDE | ENTRY | EXIT | REZ | STATUS | PNL | RET% | STRAT | DCA | VOLAT | MARKET_ID | EQUITY_BEFORE | STAKE | EQUITY_AFTER | AUDIT"
+                    );
+                }
+            }
+
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(filename)
+            {
+                if let Err(e) = writeln!(file, "{}", row) {
+                    error!("Failed to write to {}: {}", filename, e);
+                }
+            }
+        }
+    }
+}
