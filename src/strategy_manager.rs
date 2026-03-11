@@ -236,10 +236,28 @@ impl StrategyManager {
                 let is_trading_window = now.hour() >= start_hour && now.hour() < end_hour;
                 if !is_trading_window {
                     if now.second() % 30 == 0 {
-                        info!("🔍 DCA: Fuera de ventana horaria ({}–{} UTC). Actualmente: {} UTC. Esperando...", start_hour, end_hour, now.hour());
+                        info!("🔍 DCA: Outside trading window ({}–{} UTC). Currently: {} UTC. Waiting...", start_hour, end_hour, now.hour());
                     }
                     return;
                 }
+
+                // --- NEW FILTERS ---
+                // 1. Volatility Filter: No Low
+                if vol_regime == VolRegime::Low {
+                    if now.second() % 30 == 0 {
+                        info!("⏳ DCA: Skipping scan - Low Volatility detected.");
+                    }
+                    return;
+                }
+
+                // 2. Search Window Filter: [166s, 269s] (2:46 to 4:29)
+                if bucket_elapsed < 166 || bucket_elapsed > 269 {
+                    if now.second() % 30 == 0 {
+                        info!("⏳ DCA: Outside search window ({}s). Window: [166s - 269s] (2:46 - 4:29)", bucket_elapsed);
+                    }
+                    return;
+                }
+                // -------------------
 
                 if token_ask >= 0.91 {
                     self.peak_detected = true;

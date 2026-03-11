@@ -170,7 +170,7 @@ async fn main() {
                 }
 
                 // 3. Process Ticks
-                let is_hard_close_window = _bucket_elapsed_ms >= 298_500;
+                let is_hard_close_window = _bucket_elapsed_ms >= 297_000;
                 let kill_switch_active = equity_manager::is_kill_switch_active();
 
                 if kill_switch_active && now.second() == 0 {
