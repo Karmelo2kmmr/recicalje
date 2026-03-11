@@ -56,6 +56,7 @@ async fn main() {
 
     // Market timing tracking
     let mut last_market_bucket = 0i64;
+    let mut cool_down_until: Option<chrono::DateTime<Utc>> = None;
 
     reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n🏔️ Peak Range: 0.91-0.95 | Pullback: 0.03\n🛡️ SL Estricto: 0.67 | TP Global: 0.96\n♻️ Reciclaje: L3, L4, L5 (+0.06)").await;
 
@@ -203,6 +204,41 @@ async fn main() {
 
                     if strategy.state == StrategyState::Scanning {
                         if kill_switch_active { continue; }
+
+                        // --- NEW: Cool-down Check ---
+                        if let Some(until) = cool_down_until {
+                            if Utc::now() < until {
+                                if now.second() == 0 && _bucket_elapsed_ms < 1000 {
+                                    info!("🧊 Bot en periodo de enfriamiento (consecutive SL). Reanudando en: {} ET", 
+                                        until.with_timezone(&FixedOffset::west_opt(4 * 3600).unwrap()).format("%H:%M:%S"));
+                                }
+                                continue;
+                            } else {
+                                info!("🔥 Cool-down finalizado. Reanudando operaciones.");
+                                cool_down_until = None;
+                            }
+                        }
+
+                        // Check for 5 consecutive losses to trigger cool-down
+                        let consecutive_losses = equity_manager::get_consecutive_losses("DCA-Reciclaje");
+                        if consecutive_losses >= 5 {
+                            let duration = chrono::Duration::minutes(45);
+                            cool_down_until = Some(Utc::now() + duration);
+                            
+                            let until_et = cool_down_until.unwrap().with_timezone(&FixedOffset::west_opt(4 * 3600).unwrap());
+                            warn!("🚨 Racha de {} SL detectada. Activando pausa de seguridad de 45 min. Reanudación: {} ET", consecutive_losses, until_et.format("%H:%M:%S"));
+                            
+                            reporter.send_message(&format!(
+                                "🛡️ *Pausa de Seguridad Activada*\n\
+                                • Racha: *{} SL consecutivos*\n\
+                                • Acción: Deteniendo nuevas entradas por *45 min*\n\
+                                • Reanudación aprox: *{} ET*",
+                                consecutive_losses,
+                                until_et.format("%H:%M:%S")
+                            )).await;
+                            continue;
+                        }
+                        // ----------------------------
 
                         // 1. Process Main Token (Initially UP, but flips to DOWN if peak found there first)
                         if let Some((bid, ask)) = strategy.api.get_market_price(&strategy.token_id_main).await {
