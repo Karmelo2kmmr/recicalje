@@ -30,7 +30,7 @@ const RECYCLE_RANGE_HI: f64 = 0.95;
 /// Stop Loss global estricto (todas las posiciones)
 const GLOBAL_SL: f64 = 0.67;
 /// Take Profit global
-const GLOBAL_TP: f64 = 0.96;
+const GLOBAL_TP: f64 = 0.97;
 /// Take Profit especial para compra 5 (índice 4)
 const BUY5_TP: f64 = 0.85;
 /// Ventana horaria de trading (hora UTC): 14:00 → 22:00
@@ -308,11 +308,11 @@ impl StrategyManager {
                             self.reporter.send_message(&format!(
                                 "🎯 *DCA+RECICLAJE — Compra 1*\n\
                                 • Pico detectado: *{:.3}*\n\
-                                • Entrada: *{:.3}*\n\
+                                • Entrada: *{:.3}* (Lado: *{}*)\n\
                                 • Stake: *${:.2}*\n\
                                 • TP: {:.2} | SL estricto: {:.2}\n\
                                 • Régimen: {:?} | σ: {:.2}%",
-                                self.max_observed_price, token_ask, stake, GLOBAL_TP, GLOBAL_SL, self.current_regime, vol_pct
+                                self.max_observed_price, token_ask, self.side, stake, GLOBAL_TP, GLOBAL_SL, self.current_regime, vol_pct
                             )).await;
                         }
                     }
@@ -477,17 +477,17 @@ impl StrategyManager {
                                 let recycle_info = if can_rec {
                                     format!("| ♻️ Reciclaje en {:.3}", rec_target)
                                 } else {
-                                    let tp_lvl = if i == 4 { "0.85" } else { "0.96" };
+                                    let tp_lvl = if i == 4 { "0.85" } else { "0.97" };
                                     format!("| TP: {}", tp_lvl)
                                 };
 
                                 self.reporter.send_message(&format!(
                                     "📊 *DCA+RECICLAJE — Compra {}*\n\
-                                    • Entrada: *{:.3}* {}\n\
+                                    • Entrada: *{:.3}* (Lado: *{}*) {}\n\
                                     • Stake: *${:.2}*\n\
                                     • Avg. precio global: *{:.3}*\n\
                                     • SL Estricto: 0.67",
-                                    i + 1, lvl_price, recycle_info, stake, self.average_price
+                                    i + 1, lvl_price, self.side, recycle_info, stake, self.average_price
                                 )).await;
                             }
                         }
