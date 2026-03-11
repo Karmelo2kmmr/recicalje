@@ -57,7 +57,7 @@ async fn main() {
     // Market timing tracking
     let mut last_market_bucket = 0i64;
 
-    reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n🏔️ Peak Range: 0.91-0.95 | Pullback: 0.03\n🛡️ SL Estricto: 0.67 | TP Global: 0.96\n♻️ Reciclaje: L3, L4, L5 (+0.06)").await;
+    // reporter.send_message("🤖 *DCA+Reciclaje Bot Activado*\n🏔️ Peak Range: 0.91-0.95 | Pullback: 0.03\n🛡️ SL Estricto: 0.67 | TP Global: 0.96\n♻️ Reciclaje: L3, L4, L5 (+0.06)").await;
 
     loop {
         match price_rx.recv().await {
@@ -115,12 +115,14 @@ async fn main() {
                             strategy.force_close_on_expiration(price as f64).await;
                         }
                         
-                        let current_equity = equity_manager::compute_equity();
+                        let _current_equity = equity_manager::compute_equity();
+                        /*
                         reporter.send_message(&format!(
                             "🤝 *ya se serro el mercado*\n\
                              • balance actual: *${:.2}*",
                             current_equity
                         )).await;
+                        */
 
                         reporter.notify_market_closed().await;
                     }
@@ -132,15 +134,17 @@ async fn main() {
 
                     let current_equity = equity_manager::compute_equity();
                     let stakes = equity_manager::calculate_dca_stakes(current_equity);
-                    let stakes_str = stakes.iter().enumerate()
+                    let _stakes_str = stakes.iter().enumerate()
                         .map(|(i, s)| format!("L{}: ${:.2}", i+1, s))
                         .collect::<Vec<_>>().join(" | ");
                     
+                    /*
                     reporter.send_message(&format!(
                         "📦 *Configurando nuevo ciclo*\n\
                          • Asignación: {}",
                         stakes_str
                     )).await;
+                    */
 
                     let markets = api.get_active_5m_markets().await;
                     for m in &markets {
