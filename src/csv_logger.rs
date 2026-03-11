@@ -39,17 +39,23 @@ impl CSVLogger {
         let master_filename = "trades.csv".to_string();
 
         let pnl_str = if pnl >= 0.0 {
-            format!("$+{:.2}", pnl)
+            format!("$+{}   ", format!("{:.2}", pnl))
         } else {
-            format!("$-{:.2}", pnl.abs())
+            format!("$-{}   ", format!("{:.2}", pnl.abs()))
+        };
+
+        let ret_str = if ret_pct >= 0.0 {
+            format!("{:<5.1} %", ret_pct)
+        } else {
+            format!("{:<5.1} %", ret_pct)
         };
 
         // Default AUDIT status is PENDING
         let audit = "PENDING";
 
         let row = format!(
-            "{:<10} | {:<5} | {:<4} | {:<6.3} | {:<6.3} | {:<3} | {:<20} | {:<8} | {:<6.1}% | {:<15} | {:<3} | {:<10} | {:<42} | ${:<8.2} | ${:<7.2} | ${:<8.2} | {}",
-            time_str, coin, side, entry, exit, rez, status, pnl_str, ret_pct, strat, dca, volatility, market_id,
+            "{:<10} | {:<5} | {:<4} | {:<6.3} | {:<6.3} | {:<3} | {:<21} | {:<8} | {:<7} | {:<15} | {:<3} | {:<10} | {:<42} | ${:<9.2}| ${:<8.2}| ${:<9.2}| {}",
+            time_str, coin, side, entry, exit, rez, status, pnl_str.trim(), ret_str, strat, dca, volatility, market_id,
             equity_before, stake, equity_after, audit
         );
 
