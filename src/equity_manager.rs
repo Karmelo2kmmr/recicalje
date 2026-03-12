@@ -11,7 +11,7 @@ const MAX_DRAWDOWN_PCT: f64 = 0.47;
 
 /// Porcentajes de balance para los 6 niveles de DCA
 pub const DCA_STAKE_PERCENTAGES: [f64; 6] = [
-    0.04,   // L1: 4%
+    0.07,   // L1: 7%
     0.04,   // L2: 4%
     0.04,   // L3: 4%
     0.06,   // L4: 6%
