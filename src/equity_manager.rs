@@ -112,8 +112,8 @@ pub fn get_consecutive_losses(strategy_name: &str) -> usize {
             let strat = parts[9].trim();
             if strat == strategy_name {
                 let status = parts[6].trim();
-                // Si encontramos un WIN, la racha termina.
-                if status.contains("CLOSED-WIN") {
+                // Si encontramos un WIN o una PAUSA, la racha termina.
+                if status.contains("CLOSED-WIN") || status.contains("SECURITY-PAUSE") {
                     break;
                 }
                 // Si encontramos un LOSS, aumentamos contador.

@@ -88,4 +88,33 @@ impl CSVLogger {
             }
         }
     }
+
+    pub fn log_security_pause(&self, strat: &str) {
+        let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
+        let now_et = Utc::now().with_timezone(&et_offset);
+        let time_str = now_et.format("%H:%M:%S").to_string();
+        let date_str = now_et.format("%Y-%m-%d").to_string();
+        
+        let dated_filename = format!("trades_{}.csv", date_str);
+        let master_filename = "trades.csv".to_string();
+
+        // Format is similar to log_trade but with most fields empty/placeholders
+        // TIME | COIN | SIDE | ENT | EXI | REZ | STATUS | PNL | RET | STRAT | ...
+        let row = format!(
+            "{:<10} | {:<5} | {:<4} | {:<6} | {:<6} | {:<3} | {:<21} | {:<8} | {:<7} | {:<15} | {:<3} | {:<10} | {:<42} | ${:<9.2}| ${:<8.2}| ${:<9.2}| {}",
+            time_str, "---", "---", "---", "---", "---", "SECURITY-PAUSE", "---", "---", strat, "---", "---", "---",
+            0.0, 0.0, 0.0, "---"
+        );
+
+        for filename in &[dated_filename, master_filename] {
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(filename)
+            {
+                let _ = writeln!(file, "{}", row);
+            }
+        }
+    }
 }

@@ -228,6 +228,8 @@ async fn main() {
                             let until_et = cool_down_until.unwrap().with_timezone(&FixedOffset::west_opt(4 * 3600).unwrap());
                             warn!("🚨 Racha de {} SL detectada. Activando pausa de seguridad de 45 min. Reanudación: {} ET", consecutive_losses, until_et.format("%H:%M:%S"));
                             
+                            csv_logger.log_security_pause("DCA-Reciclaje");
+
                             reporter.send_message(&format!(
                                 "🛡️ *Pausa de Seguridad Activada*\n\
                                 • Racha: *{} SL consecutivos*\n\
