@@ -1,0 +1,23 @@
+# 1. Detener el bot
+cd ~/recicalje && sudo systemctl stop bot-reciclaje && git pull origin main && cargo build --release && sudo systemctl start bot-reciclaje
+
+
+# 2. Descargar el nuevo formato de CSV
+cd ~/recicalje && git pull origin main
+
+# 3. Compilar los cambios (tardará unos minutos)
+cargo build --release && sudo systemctl start bot-reciclaje
+
+# 5. Volver a arrancar el bot
+sudo systemctl start bot-reciclaje
+
+
+
+# Para ver los trades de hoy:
+cd ~/recicalje && python3 auditar.py
+
+# Para ver los trades de ayer:
+python3 auditar.py --yesterday
+
+# Para auditar un archivo específico:
+python3 auditar.py --file reciclaje.csv

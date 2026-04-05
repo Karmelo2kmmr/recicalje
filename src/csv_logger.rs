@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
-use chrono::{Utc, FixedOffset};
+
+use chrono::{FixedOffset, Utc};
 use log::error;
 
 #[derive(Clone)]
@@ -29,43 +30,46 @@ impl CSVLogger {
         equity_after: f64,
         volatility: &str,
     ) {
-        // New York is UTC-4 (EDT)
         let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
         let now_et = Utc::now().with_timezone(&et_offset);
         let time_str = now_et.format("%H:%M:%S").to_string();
         let date_str = now_et.format("%Y-%m-%d").to_string();
-        
+
         let dated_filename = format!("trades_{}.csv", date_str);
         let master_filename = "trades.csv".to_string();
 
         let pnl_str = if pnl >= 0.0 {
-            format!("$+{}   ", format!("{:.2}", pnl))
+            format!("$+{:.2}", pnl)
         } else {
-            format!("$-{}   ", format!("{:.2}", pnl.abs()))
+            format!("$-{:.2}", pnl.abs())
         };
-
-        let ret_str = if ret_pct >= 0.0 {
-            format!("{:<5.1} %", ret_pct)
-        } else {
-            format!("{:<5.1} %", ret_pct)
-        };
-
-        // Default AUDIT status is PENDING
-        let audit = "PENDING";
+        let ret_str = format!("{:.1} %", ret_pct);
 
         let row = format!(
-            "{:<10} | {:<5} | {:<4} | {:<6.3} | {:<6.3} | {:<3} | {:<21} | {:<8} | {:<7} | {:<15} | {:<3} | {:<10} | {:<42} | ${:<9.2}| ${:<8.2}| ${:<9.2}| {}",
-            time_str, coin, side, entry, exit, rez, status, pnl_str.trim(), ret_str, strat, dca, volatility, market_id,
-            equity_before, stake, equity_after, audit
+            "{:<10} | {:<5} | {:<4} | {:<6.3} | {:<6.3} | {:<3} | {:<21} | {:<8} | {:<7} | {:<20} | {:<3} | {:<10} | {:<42} | ${:<9.2}| ${:<8.2}| ${:<9.2}| {}",
+            time_str,
+            coin,
+            side,
+            entry,
+            exit,
+            rez,
+            status,
+            pnl_str,
+            ret_str,
+            strat,
+            dca,
+            volatility,
+            market_id,
+            equity_before,
+            stake,
+            equity_after,
+            "PENDING"
         );
 
-        // Write to both files
         for filename in &[dated_filename, master_filename] {
-            // Ensure header exists
             if !std::path::Path::new(filename).exists() {
                 if let Ok(mut file) = OpenOptions::new()
                     .create(true)
-                    .write(true)
                     .append(true)
                     .open(filename)
                 {
@@ -78,42 +82,12 @@ impl CSVLogger {
 
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
-                .write(true)
                 .append(true)
                 .open(filename)
             {
                 if let Err(e) = writeln!(file, "{}", row) {
                     error!("Failed to write to {}: {}", filename, e);
                 }
-            }
-        }
-    }
-
-    pub fn log_security_pause(&self, strat: &str) {
-        let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
-        let now_et = Utc::now().with_timezone(&et_offset);
-        let time_str = now_et.format("%H:%M:%S").to_string();
-        let date_str = now_et.format("%Y-%m-%d").to_string();
-        
-        let dated_filename = format!("trades_{}.csv", date_str);
-        let master_filename = "trades.csv".to_string();
-
-        // Format is similar to log_trade but with most fields empty/placeholders
-        // TIME | COIN | SIDE | ENT | EXI | REZ | STATUS | PNL | RET | STRAT | ...
-        let row = format!(
-            "{:<10} | {:<5} | {:<4} | {:<6} | {:<6} | {:<3} | {:<21} | {:<8} | {:<7} | {:<15} | {:<3} | {:<10} | {:<42} | ${:<9.2}| ${:<8.2}| ${:<9.2}| {}",
-            time_str, "---", "---", "---", "---", "---", "SECURITY-PAUSE", "---", "---", strat, "---", "---", "---",
-            0.0, 0.0, 0.0, "---"
-        );
-
-        for filename in &[dated_filename, master_filename] {
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(true)
-                .open(filename)
-            {
-                let _ = writeln!(file, "{}", row);
             }
         }
     }

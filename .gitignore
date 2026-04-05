@@ -12,6 +12,8 @@ Cargo.lock
 bot_out.log
 bot_err.log
 bot_pid.txt
+bot_out_*.log
+bot_err_*.log
 
 # Trades history (datos privados)
 trades.csv
