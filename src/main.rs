@@ -62,6 +62,7 @@ async fn main() {
                 let bucket_elapsed_ms = now_ms % 300_000;
                 let bucket_elapsed_secs = (bucket_elapsed_ms / 1_000) as u64;
                 let current_bucket = (now.timestamp() / 300) * 300;
+                let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
 
                 btc_momentum_prices.push_back((now.timestamp(), price));
                 while let Some((ts, _)) = btc_momentum_prices.front() {
@@ -100,7 +101,23 @@ async fn main() {
 
                         let up_token = market.tokens.iter().find(|t| t.outcome == "Up");
                         if let Some(up) = up_token {
+                            let bucket_start_utc = chrono::DateTime::<Utc>::from_timestamp(current_bucket, 0)
+                                .unwrap_or(now);
+                            let bucket_start_et = bucket_start_utc.with_timezone(&et_offset);
+                            let captured_at_et = now.with_timezone(&et_offset);
+
                             info!("New BTC 5m market detected: {} | ID: {}", market.question, market.id);
+                            info!(
+                                "MARKET BASELINE | market_id {} | question '{}' | strike_price {:.2} | source Polymarket RTDS Chainlink btc/usd | bucket_start_utc {} | bucket_start_et {} | captured_at_utc {} | captured_at_et {} | capture_delay_ms {}",
+                                market.id,
+                                market.question,
+                                price,
+                                bucket_start_utc.format("%Y-%m-%d %H:%M:%S"),
+                                bucket_start_et.format("%Y-%m-%d %H:%M:%S"),
+                                now.format("%Y-%m-%d %H:%M:%S%.3f"),
+                                captured_at_et.format("%Y-%m-%d %H:%M:%S%.3f"),
+                                bucket_elapsed_ms
+                            );
                             active_strategies.insert(
                                 market.id.clone(),
                                 StrategyManager::new(
@@ -167,7 +184,6 @@ async fn main() {
 
                 active_strategies.retain(|_, strategy| strategy.state != StrategyState::Finished);
 
-                let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
                 let now_et = Utc::now().with_timezone(&et_offset);
                 let hour = now_et.hour();
                 let minute = now_et.minute();
