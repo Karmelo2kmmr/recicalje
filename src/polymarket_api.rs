@@ -8,6 +8,7 @@ const GAMMA_URL: &str = "https://gamma-api.polymarket.com";
 pub struct Market {
     pub id: String,
     pub question: String,
+    pub bucket_start_ts: i64,
     #[serde(rename = "outcomePrices")]
     pub outcome_prices: Option<String>,
     #[serde(rename = "clobTokenIds")]
@@ -36,13 +37,8 @@ impl PolymarketAPI {
         }
     }
 
-    pub async fn get_active_5m_markets(&self) -> Vec<Market> {
+    pub async fn get_active_5m_markets(&self, bucket_start: i64) -> Vec<Market> {
         let mut filtered = Vec::new();
-
-        // Calculate the current 5-minute bucket (Unix timestamp in UTC)
-        let now = chrono::Utc::now();
-        let now_ts = now.timestamp();
-        let bucket_start = (now_ts / 300) * 300; // Round down to nearest 5 mins
 
         // Check current window and next 2 windows
         for i in 0..3 {
@@ -95,6 +91,7 @@ impl PolymarketAPI {
                             filtered.push(Market {
                                 id: m["id"].as_str().unwrap_or_default().to_string(),
                                 question: question.to_string(),
+                                bucket_start_ts: ts,
                                 outcome_prices: m["outcomePrices"].as_str().map(|s| s.to_string()),
                                 clob_token_ids: m["clobTokenIds"].as_str().map(|s| s.to_string()),
                                 tokens,

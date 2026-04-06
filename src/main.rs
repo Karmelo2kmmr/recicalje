@@ -9,7 +9,7 @@ mod time_utils;
 
 use std::collections::{HashMap, VecDeque};
 
-use binance_ws::BinanceWS;
+use binance_ws::{BinanceWS, PriceTick};
 use chrono::{Datelike, Timelike, Utc};
 use csv_logger::CSVLogger;
 use dotenv::dotenv;
@@ -22,6 +22,15 @@ use telegram_reporter::TelegramReporter;
 const POLYMARKET_SCAN_INTERVAL_MS: i64 = 1_000;
 const POSITION_CHECK_INTERVAL_MS: i64 = 2_000;
 const BTC_MOMENTUM_WINDOW_SECS: i64 = 120;
+const BASELINE_CAPTURE_GRACE_MS: i64 = 5_000;
+
+fn normalize_feed_timestamp_ms(timestamp: i64) -> i64 {
+    if timestamp >= 1_000_000_000_000 {
+        timestamp
+    } else {
+        timestamp * 1_000
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -59,9 +68,14 @@ async fn main() {
 
     loop {
         match price_rx.recv().await {
-            Ok(price) => {
-                let now = Utc::now();
-                let now_ms = now.timestamp_millis();
+            Ok(PriceTick {
+                timestamp,
+                value: price,
+            }) => {
+                let feed_ts_ms = normalize_feed_timestamp_ms(timestamp);
+                let now = chrono::DateTime::<Utc>::from_timestamp_millis(feed_ts_ms)
+                    .unwrap_or_else(Utc::now);
+                let now_ms = feed_ts_ms;
                 let bucket_elapsed_ms = now_ms % 300_000;
                 let bucket_elapsed_secs = (bucket_elapsed_ms / 1_000) as u64;
                 let current_bucket = (now.timestamp() / 300) * 300;
@@ -93,9 +107,23 @@ async fn main() {
                     active_strategies.clear();
                     last_api_calls.clear();
 
+                    if bucket_elapsed_ms > BASELINE_CAPTURE_GRACE_MS {
+                        warn!(
+                            "Skipping current 5m market baseline capture: process saw bucket {} with delay {} ms (> {} ms grace). Waiting for next bucket.",
+                            current_bucket,
+                            bucket_elapsed_ms,
+                            BASELINE_CAPTURE_GRACE_MS
+                        );
+                        continue;
+                    }
+
                     let current_equity = equity_manager::compute_equity();
-                    let markets = api.get_active_5m_markets().await;
+                    let markets = api.get_active_5m_markets(current_bucket).await;
                     for market in &markets {
+                        if market.bucket_start_ts != current_bucket {
+                            continue;
+                        }
+
                         if active_strategies.contains_key(&market.id) {
                             continue;
                         }

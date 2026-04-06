@@ -13,6 +13,12 @@ pub struct ChainlinkPricePayload {
     pub value: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PriceTick {
+    pub timestamp: i64,
+    pub value: f64,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RTDSMessage {
     pub topic: String,
@@ -23,11 +29,11 @@ pub struct RTDSMessage {
 }
 
 pub struct BinanceWS {
-    pub tx: broadcast::Sender<f64>,
+    pub tx: broadcast::Sender<PriceTick>,
 }
 
 impl BinanceWS {
-    pub fn new() -> (Self, broadcast::Receiver<f64>) {
+    pub fn new() -> (Self, broadcast::Receiver<PriceTick>) {
         let (tx, rx) = broadcast::channel(100);
         (Self { tx }, rx)
     }
@@ -86,7 +92,10 @@ impl BinanceWS {
                                                 {
                                                     if let Some(payload) = message.payload {
                                                         if payload.symbol.eq_ignore_ascii_case(&chainlink_symbol) {
-                                                            let _ = self.tx.send(payload.value);
+                                                            let _ = self.tx.send(PriceTick {
+                                                                timestamp: payload.timestamp,
+                                                                value: payload.value,
+                                                            });
                                                         }
                                                     }
                                                 }
