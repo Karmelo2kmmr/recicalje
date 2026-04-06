@@ -2,7 +2,8 @@ import csv
 import json
 import urllib.request
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import sys
 
 # Asegurar salida UTF-8 en Windows
@@ -11,9 +12,8 @@ if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # --- CONFIGURACIÓN ---
-# New York es UTC-4 (EDT)
 def get_daily_csv(yesterday=False):
-    now_et = datetime.now(timezone(timedelta(hours=-4)))
+    now_et = datetime.now(ZoneInfo("America/New_York"))
     if yesterday:
         now_et = now_et - timedelta(days=1)
     return f"trades_{now_et.strftime('%Y-%m-%d')}.csv"

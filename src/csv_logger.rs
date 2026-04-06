@@ -1,7 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 
-use chrono::{FixedOffset, Utc};
 use log::error;
 
 #[derive(Clone)]
@@ -30,8 +29,7 @@ impl CSVLogger {
         equity_after: f64,
         volatility: &str,
     ) {
-        let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
-        let now_et = Utc::now().with_timezone(&et_offset);
+        let now_et = crate::time_utils::new_york_now();
         let time_str = now_et.format("%H:%M:%S").to_string();
         let date_str = now_et.format("%Y-%m-%d").to_string();
 
@@ -68,11 +66,7 @@ impl CSVLogger {
 
         for filename in &[dated_filename, master_filename] {
             if !std::path::Path::new(filename).exists() {
-                if let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(filename)
-                {
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(filename) {
                     let _ = writeln!(
                         file,
                         "TIME (ET) | COIN | SIDE | ENTRY | EXIT | REZ | STATUS | PNL | RET% | STRAT | DCA | VOLAT | MARKET_ID | EQUITY_BEFORE | STAKE | EQUITY_AFTER | AUDIT"
@@ -80,11 +74,7 @@ impl CSVLogger {
                 }
             }
 
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(filename)
-            {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(filename) {
                 if let Err(e) = writeln!(file, "{}", row) {
                     error!("Failed to write to {}: {}", filename, e);
                 }

@@ -229,7 +229,11 @@ impl StrategyManager {
             btc_price, self.strike_price
         );
 
-        let settlement_price = if btc_price > self.strike_price { 1.0 } else { 0.0 };
+        let settlement_price = if btc_price > self.strike_price {
+            1.0
+        } else {
+            0.0
+        };
         self.exit_all(settlement_price, "EXPIRATION").await;
     }
 

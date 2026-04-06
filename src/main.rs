@@ -1,15 +1,16 @@
 mod binance_ws;
-mod polymarket_api;
-mod telegram_reporter;
-mod strategy_manager;
 mod csv_logger;
 mod equity_manager;
+mod polymarket_api;
 mod reporting_engine;
+mod strategy_manager;
+mod telegram_reporter;
+mod time_utils;
 
 use std::collections::{HashMap, VecDeque};
 
 use binance_ws::BinanceWS;
-use chrono::{Datelike, FixedOffset, Timelike, Utc};
+use chrono::{Datelike, Timelike, Utc};
 use csv_logger::CSVLogger;
 use dotenv::dotenv;
 use log::{error, info, warn};
@@ -44,15 +45,17 @@ async fn main() {
     let mut btc_momentum_prices: VecDeque<(i64, f64)> = VecDeque::new();
     let mut last_market_bucket = 0i64;
 
-    reporter.send_message(
-        "🚀 *ALPHA MOMENTUM PURE ACTIVADO*\n\
+    reporter
+        .send_message(
+            "🚀 *ALPHA MOMENTUM PURE ACTIVADO*\n\
         • Mercado: *BTC 5m*\n\
         • Entrada: *0.86 a 0.91* con momentum BTC positivo\n\
         • Filtro BTC: *variacion >= 22 USD* vs price to beat\n\
         • Ventana: *3:10 a 4:46*\n\
         • SL duro: *0.72*\n\
         • TP total: *100% @ 0.98*",
-    ).await;
+        )
+        .await;
 
     loop {
         match price_rx.recv().await {
@@ -62,8 +65,6 @@ async fn main() {
                 let bucket_elapsed_ms = now_ms % 300_000;
                 let bucket_elapsed_secs = (bucket_elapsed_ms / 1_000) as u64;
                 let current_bucket = (now.timestamp() / 300) * 300;
-                let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
-
                 btc_momentum_prices.push_back((now.timestamp(), price));
                 while let Some((ts, _)) = btc_momentum_prices.front() {
                     if now.timestamp() - *ts > BTC_MOMENTUM_WINDOW_SECS {
@@ -101,12 +102,16 @@ async fn main() {
 
                         let up_token = market.tokens.iter().find(|t| t.outcome == "Up");
                         if let Some(up) = up_token {
-                            let bucket_start_utc = chrono::DateTime::<Utc>::from_timestamp(current_bucket, 0)
-                                .unwrap_or(now);
-                            let bucket_start_et = bucket_start_utc.with_timezone(&et_offset);
-                            let captured_at_et = now.with_timezone(&et_offset);
+                            let bucket_start_utc =
+                                chrono::DateTime::<Utc>::from_timestamp(current_bucket, 0)
+                                    .unwrap_or(now);
+                            let bucket_start_et = time_utils::to_new_york(bucket_start_utc);
+                            let captured_at_et = time_utils::to_new_york(now);
 
-                            info!("New BTC 5m market detected: {} | ID: {}", market.question, market.id);
+                            info!(
+                                "New BTC 5m market detected: {} | ID: {}",
+                                market.question, market.id
+                            );
                             info!(
                                 "MARKET BASELINE | market_id {} | question '{}' | strike_price {:.2} | source Polymarket RTDS Chainlink btc/usd | bucket_start_utc {} | bucket_start_et {} | captured_at_utc {} | captured_at_et {} | capture_delay_ms {}",
                                 market.id,
@@ -175,7 +180,11 @@ async fn main() {
                         continue;
                     }
 
-                    if let Some((bid, ask)) = strategy.api.get_market_price(&strategy.current_token_id).await {
+                    if let Some((bid, ask)) = strategy
+                        .api
+                        .get_market_price(&strategy.current_token_id)
+                        .await
+                    {
                         strategy
                             .tick(bid, ask, bucket_elapsed_secs, binance_momentum_up, price)
                             .await;
@@ -184,7 +193,7 @@ async fn main() {
 
                 active_strategies.retain(|_, strategy| strategy.state != StrategyState::Finished);
 
-                let now_et = Utc::now().with_timezone(&et_offset);
+                let now_et = time_utils::new_york_now();
                 let hour = now_et.hour();
                 let minute = now_et.minute();
 
@@ -195,7 +204,8 @@ async fn main() {
                         if LAST_6H_REPORT != hour {
                             info!("Generando reporte de 6 horas ({} ET)...", hour);
                             if let Some(report) =
-                                ReportingEngine::get_stats_report(&api, 6, "Reporte ALPHA (6H)").await
+                                ReportingEngine::get_stats_report(&api, 6, "Reporte ALPHA (6H)")
+                                    .await
                             {
                                 reporter.notify_session_report(&report).await;
                             }

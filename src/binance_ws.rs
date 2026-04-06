@@ -58,7 +58,10 @@ impl BinanceWS {
                     );
 
                     if let Err(e) = ws_stream.send(Message::Text(subscription.clone())).await {
-                        error!("Failed to subscribe to Polymarket RTDS: {}. Reconnecting...", e);
+                        error!(
+                            "Failed to subscribe to Polymarket RTDS: {}. Reconnecting...",
+                            e
+                        );
                         time::sleep(Duration::from_secs(5)).await;
                         continue;
                     }
@@ -118,7 +121,10 @@ impl BinanceWS {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to connect to Polymarket RTDS: {}. Retrying in 5s...", e);
+                    error!(
+                        "Failed to connect to Polymarket RTDS: {}. Retrying in 5s...",
+                        e
+                    );
                     time::sleep(Duration::from_secs(5)).await;
                 }
             }

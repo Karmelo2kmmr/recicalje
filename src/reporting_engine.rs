@@ -1,8 +1,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 
-use chrono::{FixedOffset, Utc};
-
 pub struct SessionStats {
     pub start_time: String,
     pub end_time: String,
@@ -25,8 +23,7 @@ impl ReportingEngine {
         hours: u32,
         label: &str,
     ) -> Option<String> {
-        let et_offset = FixedOffset::west_opt(4 * 3600).unwrap();
-        let now_et = Utc::now().with_timezone(&et_offset);
+        let now_et = crate::time_utils::new_york_now();
         let start_period = now_et - chrono::Duration::hours(hours as i64);
 
         let start_time_str = start_period.format("%H:%M").to_string();
