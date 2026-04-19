@@ -1,0 +1,38 @@
+[package]
+name = "arbitrage_hammer"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[[bin]]
+name = "arbitrage_hammer"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+log = "0.4"
+env_logger = "0.10"
+dotenv = "0.15"
+csv = "1.2"
+serde_yaml = "0.9"
+
+# Para Kalshi (SDK porta de poly_kalshi)
+rsa = "0.9"
+sha2 = "0.10"
+base64 = "0.21"
+async-trait = "0.1"
+
+# Para Polymarket CLOB
+ethers = "2.0" # Proveedor de EIP-712 y firmas L2
+ethers-core = "2.0"
+ethers-signers = "2.0"
+
+# Opcionales utils
+regex = "1"
+futures = "0.3"
+rand = "0.8"

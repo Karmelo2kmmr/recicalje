@@ -1,0 +1,6 @@
+/target
+.env
+*.pem
+*.log
+*.out.log
+*.err.log
