@@ -62,6 +62,7 @@ def build_reconciliation_response(order_id, accepted, filled_size, token_id):
         "order_id": order_id,
         "accepted": accepted,
         "filled_size": filled_size,
+        "shares_sold": filled_size,
         "remaining_live": is_live,
         "confirmed_live_orders_count": len(open_orders_after),
         "confirmed_balance_after": balance_after,

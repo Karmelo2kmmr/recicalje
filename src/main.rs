@@ -158,6 +158,20 @@ mod tests {
     }
 
     #[test]
+    fn stale_position_detection_ignores_terminal_zero_positions() {
+        let mut pos = test_position();
+        pos.state = PositionState::ResolvedConfirmed;
+        pos.shares = 0.0;
+        pos.notional_usdc = 0.0;
+        let mut positions = vec![pos];
+
+        let stale = stale_positions_for_alert(&mut positions, &[]);
+
+        assert!(stale.is_empty());
+        assert_eq!(positions.len(), 1);
+    }
+
+    #[test]
     fn safe_mode_blocks_new_entries() {
         assert!(entries_allowed_by_safe_mode(false));
         assert!(!entries_allowed_by_safe_mode(true));
@@ -210,6 +224,8 @@ fn reconcile_close_fill(
     fill: &CloseFill,
     reason: &str,
 ) -> Result<bool, String> {
+    let close_epsilon = position_close_epsilon(pos);
+
     if fill.shares_sold <= 0.001 {
         pos.state = PositionState::ExitFailedZeroFill;
         pos.last_error = Some(format!(
@@ -225,7 +241,7 @@ fn reconcile_close_fill(
         .remaining_shares
         .unwrap_or_else(|| (previous_shares - fill.shares_sold).max(0.0));
 
-    if remaining > 0.001 || fill.shares_sold + 0.001 < previous_shares {
+    if remaining > close_epsilon || fill.shares_sold + close_epsilon < previous_shares {
         let remaining = remaining.max(previous_shares - fill.shares_sold).max(0.0);
         let ratio = if previous_shares > 0.0 {
             (remaining / previous_shares).clamp(0.0, 1.0)
@@ -244,6 +260,8 @@ fn reconcile_close_fill(
     }
 
     pos.state = PositionState::ClosedConfirmed;
+    pos.shares = 0.0;
+    pos.notional_usdc = 0.0;
     pos.last_error = None;
     pos.updated_at = Some(now_rfc3339());
     Ok(true)
@@ -251,6 +269,23 @@ fn reconcile_close_fill(
 
 fn entries_allowed_by_safe_mode(safe_mode_active: bool) -> bool {
     !safe_mode_active
+}
+
+fn is_terminal_zero_position(pos: &OpenPosition) -> bool {
+    pos.shares <= position_close_epsilon(pos)
+        && matches!(
+            pos.state,
+            PositionState::Closed
+                | PositionState::ClosedConfirmed
+                | PositionState::ResolvedConfirmed
+        )
+}
+
+fn position_close_epsilon(pos: &OpenPosition) -> f64 {
+    match pos.venue {
+        Venue::Polymarket => env_f64("POLYMARKET_DUST_SHARES", 0.01),
+        Venue::Kalshi => 0.001,
+    }
 }
 
 fn window_elapsed_secs(now: DateTime<Local>, window_start_mins: i32) -> i32 {
@@ -276,6 +311,12 @@ fn load_state() -> Vec<OpenPosition> {
     }
 }
 
+fn prune_terminal_positions(open_positions: &mut Vec<OpenPosition>) -> usize {
+    let before = open_positions.len();
+    open_positions.retain(|pos| !is_terminal_zero_position(pos));
+    before - open_positions.len()
+}
+
 fn stale_positions_for_alert(
     open_positions: &mut Vec<OpenPosition>,
     active_twins: &[DualMarketPair],
@@ -287,6 +328,7 @@ fn stale_positions_for_alert(
 
     open_positions
         .iter()
+        .filter(|pos| !is_terminal_zero_position(pos))
         .filter(|pos| !active_keys.contains(pos.twin_key.as_str()))
         .cloned()
         .collect()
@@ -470,6 +512,9 @@ fn is_polymarket_current_et_date(pm: &api::Market, now: DateTime<Local>) -> bool
             let min_remaining =
                 env_i32("MIN_MARKET_SECONDS_TO_CLOSE", default_min_remaining as i32)
                     .max(0) as i64;
+            if remaining <= 0 {
+                return false;
+            }
             if remaining < min_remaining {
                 warn!(
                     "Market {} closes in {}s — too close to trade (min_remaining={}s)",
@@ -655,7 +700,7 @@ async fn close_polymarket_position(
         .sell_fak(token, shares_rounded, price)
         .await
         .map_err(|e| format!("Polymarket sell failed: {}", e))?;
-    let sold = resp.shares_sold.unwrap_or(0.0);
+    let sold = resp.shares_sold.or(resp.filled_size).unwrap_or(0.0);
     if sold <= 0.0 {
         return Err("Polymarket sell returned zero sold shares".to_string());
     }
@@ -755,17 +800,13 @@ async fn close_kalshi_position(
     }
 
     let confirmed_sold = order_confirmed_fill.min(externally_reduced);
-    let fill_value = order
-        .taker_fill_cost_dollars
-        .as_deref()
-        .or(order.maker_fill_cost_dollars.as_deref())
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(confirmed_sold * price);
-    let avg_fill_price = if confirmed_sold > 0.0 {
-        fill_value / confirmed_sold
+    let avg_fill_price = if buy_yes {
+        order.yes_price_dollars.as_deref()
     } else {
-        price
-    };
+        order.no_price_dollars.as_deref()
+    }
+    .and_then(|v| v.parse::<f64>().ok())
+    .unwrap_or(price);
 
     Ok(CloseFill {
         fill_price: avg_fill_price,
@@ -1030,19 +1071,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while i < open_positions.len() {
             let pos = &mut open_positions[i];
             let (actual_bal, actual_buy_yes): (f64, Option<bool>) = if pos.venue == Venue::Polymarket {
-                (
-                    poly_client.get_balance(&pos.pm_token_id()).await.unwrap_or(0.0),
-                    Some(pos.buy_yes),
-                )
+                match poly_client.get_balance(&pos.pm_token_id()).await {
+                    Ok(balance) => (balance, Some(pos.buy_yes)),
+                    Err(err) => {
+                        warn!(
+                            "RECONCILE | {} Polymarket balance check failed; keeping local shares={:.4}: {}",
+                            pos.coin, pos.shares, err
+                        );
+                        (pos.shares, Some(pos.buy_yes))
+                    }
+                }
             } else {
-                let live_pos = kalshi_client.get_portfolio_positions().await.unwrap_or_default()
-                    .iter()
-                    .find(|lp| lp.ticker == pos.kalshi_ticker)
-                    .cloned();
-                (
-                    live_pos.as_ref().map(kalshi_position_contracts).unwrap_or(0.0),
-                    live_pos.as_ref().map(kalshi_position_buy_yes),
-                )
+                match kalshi_client.get_portfolio_positions().await {
+                    Ok(portfolio) => {
+                        let live_pos = portfolio
+                            .iter()
+                            .find(|lp| lp.ticker == pos.kalshi_ticker)
+                            .cloned();
+                        (
+                            live_pos.as_ref().map(kalshi_position_contracts).unwrap_or(0.0),
+                            live_pos.as_ref().map(kalshi_position_buy_yes),
+                        )
+                    }
+                    Err(err) => {
+                        warn!(
+                            "RECONCILE | {} Kalshi portfolio check failed; keeping local shares={:.4}: {}",
+                            pos.coin, pos.shares, err
+                        );
+                        (pos.shares, Some(pos.buy_yes))
+                    }
+                }
             };
 
             if let Some(actual_buy_yes) = actual_buy_yes {
@@ -1057,9 +1115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            let close_epsilon = position_close_epsilon(pos);
             if (actual_bal - pos.shares).abs() > 0.01 {
                 warn!("RECONCILE | {} mismatch: JSON={:.4} actual={:.4} | Correcting...", pos.coin, pos.shares, actual_bal);
-                if actual_bal <= 0.001 {
+                if actual_bal <= close_epsilon {
                     open_positions.remove(i);
                     continue;
                 } else {
@@ -1179,6 +1238,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
+        let pruned = prune_terminal_positions(&mut open_positions);
+        if pruned > 0 {
+            info!("RECONCILE | pruned {} terminal zero-share positions from active state.", pruned);
+        }
+
         save_state(&open_positions);
         info!("✅ Reconciliation complete. {} active positions managed.", open_positions.len());
     }
@@ -1268,34 +1332,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if bal <= 0.001 {
                             info!("Stale Kalshi position {} resolved/closed. Marking ResolvedConfirmed.", open_positions[j].kalshi_ticker);
                             open_positions[j].shares = 0.0;
+                            open_positions[j].notional_usdc = 0.0;
                             open_positions[j].state = PositionState::ResolvedConfirmed;
+                            open_positions[j].last_error = None;
+                            open_positions[j].updated_at = Some(now_rfc3339());
                             save_state(&open_positions);
                         } else {
                             // Still exists, but market is not active!
                             open_positions[j].state = PositionState::ExpiredPendingResolution;
+                            open_positions[j].shares = bal;
+                            open_positions[j].notional_usdc = bal * open_positions[j].entry_price;
+                            open_positions[j].last_error = Some(format!(
+                                "Market no longer active, but live Kalshi inventory remains ({:.4} contracts). Holding under bot control until resolved.",
+                                bal
+                            ));
+                            open_positions[j].updated_at = Some(now_rfc3339());
                             save_state(&open_positions);
                         }
                     } else {
                         // Not in portfolio -> resolved
                         info!("Stale Kalshi position {} not in portfolio. Marking ResolvedConfirmed.", open_positions[j].kalshi_ticker);
                         open_positions[j].shares = 0.0;
+                        open_positions[j].notional_usdc = 0.0;
                         open_positions[j].state = PositionState::ResolvedConfirmed;
+                        open_positions[j].last_error = None;
+                        open_positions[j].updated_at = Some(now_rfc3339());
                         save_state(&open_positions);
                     }
                 } else {
                     // Polymarket
                     let bal = poly_client.get_balance(open_positions[j].pm_token_id()).await.unwrap_or(open_positions[j].shares);
-                    if bal <= 0.001 {
+                    let close_epsilon = position_close_epsilon(&open_positions[j]);
+                    if bal <= close_epsilon {
                         info!("Stale Polymarket position {} resolved/closed. Marking ResolvedConfirmed.", open_positions[j].pm_token_id());
                         open_positions[j].shares = 0.0;
+                        open_positions[j].notional_usdc = 0.0;
                         open_positions[j].state = PositionState::ResolvedConfirmed;
+                        open_positions[j].last_error = None;
+                        open_positions[j].updated_at = Some(now_rfc3339());
                         save_state(&open_positions);
                     } else {
                         open_positions[j].state = PositionState::ExpiredPendingResolution;
+                        open_positions[j].shares = bal;
+                        open_positions[j].notional_usdc = bal * open_positions[j].entry_price;
+                        open_positions[j].last_error = Some(format!(
+                            "Market no longer active, but live Polymarket inventory remains ({:.4} shares). Holding under bot control until sell/redeem is confirmed.",
+                            bal
+                        ));
+                        open_positions[j].updated_at = Some(now_rfc3339());
                         save_state(&open_positions);
                     }
                 }
             }
+        }
+
+        let pruned = prune_terminal_positions(&mut open_positions);
+        if pruned > 0 {
+            info!("STATE COMPACT | pruned {} terminal zero-share positions.", pruned);
+            save_state(&open_positions);
         }
         
         // --- EVALUATE SAFE MODE ---
@@ -1749,9 +1843,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let proceeds = fill.shares_sold * fill.fill_price;
                             capital_manager.add(&pos.venue_platform(), proceeds);
                             if let Some(bot) = telegram_bot.as_ref() {
+                                let is_win = proceeds >= pos.notional_usdc;
                                 let msg = format_close_message(
                                     &pos.coin,
-                                    true,
+                                    is_win,
                                     "TAKE-PROFIT",
                                     pos.entry_price,
                                     fill.fill_price,

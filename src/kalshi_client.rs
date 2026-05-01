@@ -248,6 +248,8 @@ pub struct KalshiOrder {
     pub status: String,
     pub fill_count_fp: String,
     pub remaining_count_fp: String,
+    pub yes_price_dollars: Option<String>,
+    pub no_price_dollars: Option<String>,
     pub taker_fill_cost_dollars: Option<String>,
     pub maker_fill_cost_dollars: Option<String>,
 }
