@@ -4,6 +4,7 @@ import json
 import time
 import socket
 import logging
+import urllib.request
 from threading import Thread
 import math
 from decimal import Decimal, ROUND_DOWN
@@ -214,6 +215,34 @@ def handle_buy(req):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+def handle_health(_req):
+    host = os.environ.get("POLYMARKET_HOST", "https://clob.polymarket.com").strip() or "https://clob.polymarket.com"
+    url = f"{host.rstrip('/')}/version"
+    try:
+        started = time.perf_counter()
+        request = urllib.request.Request(url, headers={"User-Agent": "arbitrage-hammer-health"})
+        with urllib.request.urlopen(request, timeout=2.0) as response:
+            body = response.read(256).decode("utf-8", errors="replace").lower()
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            ready = response.status == 200 and not any(
+                marker in body for marker in ("syncing", "not_ready", "not ready", "service not ready")
+            )
+            return {
+                "status": "ok",
+                "data": {
+                    "ready": ready,
+                    "http_status": response.status,
+                    "latency_ms": latency_ms,
+                    "body": body[:120],
+                },
+            }
+    except Exception as e:
+        return {
+            "status": "ok",
+            "message": f"health_check_failed: {e}",
+            "data": {"ready": False, "reason": str(e)},
+        }
+
 def handle_sell(req):
     try:
         token_id = req["token_id"]
@@ -347,6 +376,7 @@ def process_client(conn):
             elif cmd == "reconcile_balance": resp = handle_balance(req)
             elif cmd == "collateral_status": resp = handle_collateral_status(req)
             elif cmd == "get_markets": resp = handle_get_markets(req)
+            elif cmd == "health": resp = handle_health(req)
             elif cmd == "ping": resp = {"status": "ok"}
 
             res_json = json.dumps(resp).encode("utf-8") + b"\n"

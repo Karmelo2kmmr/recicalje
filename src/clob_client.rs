@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -42,6 +42,12 @@ pub struct ClobResponse {
     pub data: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClobHealth {
+    Ready,
+    NotReady(String),
+}
+
 pub struct PolymarketClobClient {
     pub http_client: Client, // For Gamma API calls (prices, etc)
 }
@@ -54,6 +60,14 @@ impl PolymarketClobClient {
                 .build()
                 .unwrap(),
         }
+    }
+
+    pub fn is_425_service_not_ready(error: &(dyn Error + 'static)) -> bool {
+        let msg = error.to_string().to_ascii_lowercase();
+        msg.contains("status_code=425")
+            || msg.contains("http/2 425")
+            || msg.contains("425 too early")
+            || msg.contains("service not ready")
     }
 
     async fn send_to_daemon(req: ClobRequest) -> Result<ClobResponse, Box<dyn Error>> {
@@ -155,6 +169,84 @@ impl PolymarketClobClient {
         .await?;
 
         Ok(())
+    }
+
+    pub async fn clob_health(&self) -> Result<ClobHealth, Box<dyn Error>> {
+        let resp = Self::send_to_daemon(ClobRequest {
+            cmd: "health".into(),
+            token_id: "".into(),
+            usdc_size: None,
+            token_qty: None,
+            limit_price: None,
+            order_type: None,
+            order_id: None,
+            tag_id: None,
+        })
+        .await?;
+
+        let ready = resp
+            .data
+            .as_ref()
+            .and_then(|data| data.get("ready"))
+            .and_then(|ready| ready.as_bool())
+            .unwrap_or(true);
+
+        if ready {
+            Ok(ClobHealth::Ready)
+        } else {
+            let reason = resp
+                .message
+                .or_else(|| {
+                    resp.data
+                        .as_ref()
+                        .and_then(|data| data.get("reason"))
+                        .and_then(|reason| reason.as_str())
+                        .map(|reason| reason.to_string())
+                })
+                .unwrap_or_else(|| "not_ready".to_string());
+            Ok(ClobHealth::NotReady(reason))
+        }
+    }
+
+    pub async fn place_order_with_425_handling(
+        &self,
+        token_id: &str,
+        usdc_size: f64,
+        limit_price: f64,
+    ) -> Result<ClobResponse, Box<dyn Error>> {
+        match self.clob_health().await {
+            Ok(ClobHealth::Ready) => {}
+            Ok(ClobHealth::NotReady(reason)) => {
+                return Err(
+                    format!("Polymarket CLOB health not ready before order: {}", reason).into(),
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Polymarket CLOB health check failed; attempting order anyway: {}",
+                    e
+                );
+            }
+        }
+
+        let first = self.buy(token_id, usdc_size, limit_price).await;
+        match first {
+            Ok(resp) => Ok(resp),
+            Err(e) if Self::is_425_service_not_ready(e.as_ref()) => {
+                warn!(
+                    "Polymarket 425 service-not-ready on first order attempt; retrying once after 2s"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                match self.buy(token_id, usdc_size, limit_price).await {
+                    Ok(resp) => Ok(resp),
+                    Err(second) if Self::is_425_service_not_ready(second.as_ref()) => {
+                        Err(format!("Polymarket 425 persisted after 1 retry: {}", second).into())
+                    }
+                    Err(second) => Err(second),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn buy(

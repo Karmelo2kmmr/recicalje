@@ -4,6 +4,7 @@ use arbitrage_hammer::config;
 use arbitrage_hammer::dual_market::{
     DualCapitalManager, DualMarketPair, OpenPosition, Platform, PositionState, Venue,
 };
+use arbitrage_hammer::execution_engine::{Poly425Decision, Poly425Guard};
 use arbitrage_hammer::kalshi_client::KalshiClient;
 use arbitrage_hammer::telegram::TelegramBot;
 use chrono::{DateTime, Local, Timelike};
@@ -215,6 +216,14 @@ fn env_i32(key: &str, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
+fn is_poly_425_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("status_code=425")
+        || lower.contains("http/2 425")
+        || lower.contains("425 too early")
+        || lower.contains("service not ready")
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -373,7 +382,8 @@ async fn kalshi_live_contracts(
         .map_err(|e| format!("Kalshi position reconciliation failed: {}", e))?;
 
     let target = positions.iter().find(|pos| {
-        (pos.ticker == ticker || pos.market_ticker == ticker) && kalshi_position_buy_yes(pos) == buy_yes
+        (pos.ticker == ticker || pos.market_ticker == ticker)
+            && kalshi_position_buy_yes(pos) == buy_yes
     });
 
     Ok(target.map(kalshi_position_contracts).unwrap_or(0.0))
@@ -488,7 +498,7 @@ fn is_polymarket_current_et_date(pm: &api::Market, now: DateTime<Local>) -> bool
     let end_date = match pm.end_date.as_deref() {
         Some(d) => d,
         None => {
-            // P1 FIX: Do not assume valid if end_date is missing. 
+            // P1 FIX: Do not assume valid if end_date is missing.
             // Better to skip than to enter a zombie market.
             warn!("Market {} has no end_date — skipping for safety", pm.id);
             return false;
@@ -510,8 +520,7 @@ fn is_polymarket_current_et_date(pm: &api::Market, now: DateTime<Local>) -> bool
             let configured_entry_end = env_i32("ENTRY_END_SEC", 790).clamp(0, 899);
             let default_min_remaining = (900 - configured_entry_end).max(0) as i64;
             let min_remaining =
-                env_i32("MIN_MARKET_SECONDS_TO_CLOSE", default_min_remaining as i32)
-                    .max(0) as i64;
+                env_i32("MIN_MARKET_SECONDS_TO_CLOSE", default_min_remaining as i32).max(0) as i64;
             if remaining <= 0 {
                 return false;
             }
@@ -560,7 +569,7 @@ async fn execute_polymarket_entry(
     }
 
     let resp = poly
-        .buy(token, size_rounded, price)
+        .place_order_with_425_handling(token, size_rounded, price)
         .await
         .map_err(|e| format!("Polymarket buy failed: {}", e))?;
     let mut shares = resp.filled_size.unwrap_or(0.0);
@@ -1059,18 +1068,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut open_positions = load_state();
     let mut market_burned: HashSet<String> = HashSet::new();
+    let mut poly_425_guard = Poly425Guard::new();
     let mut last_closed_minute = -1;
 
     if startup.live_mode {
         info!("🔍 Reconciling on-chain balances with local state...");
-        
+
         let manage_live_orphans = env_bool("MANAGE_LIVE_ORPHANS", false);
 
         // A. Verify/Correct existing positions
         let mut i = 0;
         while i < open_positions.len() {
             let pos = &mut open_positions[i];
-            let (actual_bal, actual_buy_yes): (f64, Option<bool>) = if pos.venue == Venue::Polymarket {
+            let (actual_bal, actual_buy_yes): (f64, Option<bool>) = if pos.venue
+                == Venue::Polymarket
+            {
                 match poly_client.get_balance(&pos.pm_token_id()).await {
                     Ok(balance) => (balance, Some(pos.buy_yes)),
                     Err(err) => {
@@ -1089,7 +1101,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .find(|lp| lp.ticker == pos.kalshi_ticker)
                             .cloned();
                         (
-                            live_pos.as_ref().map(kalshi_position_contracts).unwrap_or(0.0),
+                            live_pos
+                                .as_ref()
+                                .map(kalshi_position_contracts)
+                                .unwrap_or(0.0),
                             live_pos.as_ref().map(kalshi_position_buy_yes),
                         )
                     }
@@ -1104,7 +1119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if let Some(actual_buy_yes) = actual_buy_yes {
-                if pos.venue == Venue::Kalshi && pos.buy_yes != actual_buy_yes && actual_bal > 0.001 {
+                if pos.venue == Venue::Kalshi && pos.buy_yes != actual_buy_yes && actual_bal > 0.001
+                {
                     warn!(
                         "RECONCILE | {} Kalshi side mismatch: JSON={} actual={} | Correcting...",
                         pos.coin,
@@ -1117,7 +1133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let close_epsilon = position_close_epsilon(pos);
             if (actual_bal - pos.shares).abs() > 0.01 {
-                warn!("RECONCILE | {} mismatch: JSON={:.4} actual={:.4} | Correcting...", pos.coin, pos.shares, actual_bal);
+                warn!(
+                    "RECONCILE | {} mismatch: JSON={:.4} actual={:.4} | Correcting...",
+                    pos.coin, pos.shares, actual_bal
+                );
                 if actual_bal <= close_epsilon {
                     open_positions.remove(i);
                     continue;
@@ -1130,12 +1149,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // B. ADOPT ORPHANS: Check all active twins for balances NOT in JSON
-        let initial_twins = build_twin_markets(&kalshi_client, &poly_client, Local::now(), &mut last_closed_minute, None).await;
+        let initial_twins = build_twin_markets(
+            &kalshi_client,
+            &poly_client,
+            Local::now(),
+            &mut last_closed_minute,
+            None,
+        )
+        .await;
         for twin in initial_twins {
             // Check Polymarket Yes/No
             for (token_id, buy_yes) in [(&twin.pm_yes_token, true), (&twin.pm_no_token, false)] {
                 let bal = poly_client.get_balance(token_id).await.unwrap_or(0.0);
-                if bal > 0.01 && !open_positions.iter().any(|p| p.venue == Venue::Polymarket && p.pm_yes_token == twin.pm_yes_token && p.buy_yes == buy_yes) {
+                if bal > 0.01
+                    && !open_positions.iter().any(|p| {
+                        p.venue == Venue::Polymarket
+                            && p.pm_yes_token == twin.pm_yes_token
+                            && p.buy_yes == buy_yes
+                    })
+                {
                     if !manage_live_orphans {
                         warn!(
                             "ORPHAN DETECTED UNMANAGED | Polymarket {} {} | shares={:.4}",
@@ -1154,7 +1186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     }
-                    info!("🛡️ ORPHAN ADOPTED | Polymarket {} | shares={:.4}", twin.coin, bal);
+                    info!(
+                        "🛡️ ORPHAN ADOPTED | Polymarket {} | shares={:.4}",
+                        twin.coin, bal
+                    );
                     open_positions.push(OpenPosition {
                         twin_key: twin.kalshi_ticker.clone(),
                         venue: Venue::Polymarket,
@@ -1184,11 +1219,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             // Check Kalshi (already checked in preflight but for adoption)
-            let kalshi_pos = kalshi_client.get_portfolio_positions().await.unwrap_or_default();
+            let kalshi_pos = kalshi_client
+                .get_portfolio_positions()
+                .await
+                .unwrap_or_default();
             if let Some(lp) = kalshi_pos.iter().find(|p| p.ticker == twin.kalshi_ticker) {
                 let bal = kalshi_position_contracts(lp);
                 let buy_yes = kalshi_position_buy_yes(lp);
-                if bal > 0.1 && !open_positions.iter().any(|p| p.venue == Venue::Kalshi && p.kalshi_ticker == twin.kalshi_ticker) {
+                if bal > 0.1
+                    && !open_positions
+                        .iter()
+                        .any(|p| p.venue == Venue::Kalshi && p.kalshi_ticker == twin.kalshi_ticker)
+                {
                     if !manage_live_orphans {
                         warn!(
                             "ORPHAN DETECTED UNMANAGED | Kalshi {} {} | shares={:.1}",
@@ -1207,7 +1249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     }
-                    info!("🛡️ ORPHAN ADOPTED | Kalshi {} | shares={:.1}", twin.coin, bal);
+                    info!(
+                        "🛡️ ORPHAN ADOPTED | Kalshi {} | shares={:.1}",
+                        twin.coin, bal
+                    );
                     open_positions.push(OpenPosition {
                         twin_key: twin.kalshi_ticker.clone(),
                         venue: Venue::Kalshi,
@@ -1237,14 +1282,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        
+
         let pruned = prune_terminal_positions(&mut open_positions);
         if pruned > 0 {
-            info!("RECONCILE | pruned {} terminal zero-share positions from active state.", pruned);
+            info!(
+                "RECONCILE | pruned {} terminal zero-share positions from active state.",
+                pruned
+            );
         }
 
         save_state(&open_positions);
-        info!("✅ Reconciliation complete. {} active positions managed.", open_positions.len());
+        info!(
+            "✅ Reconciliation complete. {} active positions managed.",
+            open_positions.len()
+        );
     }
 
     if let Some(bot) = telegram_bot.as_ref() {
@@ -1271,7 +1322,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let entry_start_secs = env_i32("ENTRY_START_SEC", 540);
     let entry_end_secs = env_i32("ENTRY_END_SEC", 790);
     let mut safe_mode_active = false;
-    let mut last_alert_times: std::collections::HashMap<String, chrono::DateTime<chrono::Local>> = std::collections::HashMap::new();
+    let mut last_alert_times: std::collections::HashMap<String, chrono::DateTime<chrono::Local>> =
+        std::collections::HashMap::new();
 
     loop {
         let now = chrono::Local::now();
@@ -1288,11 +1340,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !stale_positions.is_empty() {
             let mut alerted_any = false;
             let mut alert_details = Vec::new();
-            
+
             for pos in &stale_positions {
-                let last_alert = last_alert_times.get(&pos.twin_key).copied().unwrap_or(chrono::Local::now() - chrono::Duration::seconds(61));
+                let last_alert = last_alert_times
+                    .get(&pos.twin_key)
+                    .copied()
+                    .unwrap_or(chrono::Local::now() - chrono::Duration::seconds(61));
                 if (chrono::Local::now() - last_alert).num_seconds() > 60 {
-                    alert_details.push(format!("{} {} (Estado: {:?}, Prox. intento: 10s)", pos.coin, pos.twin_key, pos.state));
+                    alert_details.push(format!(
+                        "{} {} (Estado: {:?}, Prox. intento: 10s)",
+                        pos.coin, pos.twin_key, pos.state
+                    ));
                     last_alert_times.insert(pos.twin_key.clone(), chrono::Local::now());
                     alerted_any = true;
                 }
@@ -1312,7 +1370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )).await;
                 }
             }
-            
+
             // --- POSITION RECOVERY MANAGER (For Stale / Adrift Positions) ---
             for stale_pos in stale_positions {
                 let mut j = 0;
@@ -1322,12 +1380,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     j += 1;
                 }
-                if j >= open_positions.len() { continue; }
-                
+                if j >= open_positions.len() {
+                    continue;
+                }
+
                 // Fetch live positions from Kalshi to check if it really disappeared
                 if open_positions[j].venue == Venue::Kalshi {
-                    let kalshi_pos = kalshi_client.get_portfolio_positions().await.unwrap_or_default();
-                    if let Some(lp) = kalshi_pos.iter().find(|p| p.ticker == open_positions[j].kalshi_ticker) {
+                    let kalshi_pos = kalshi_client
+                        .get_portfolio_positions()
+                        .await
+                        .unwrap_or_default();
+                    if let Some(lp) = kalshi_pos
+                        .iter()
+                        .find(|p| p.ticker == open_positions[j].kalshi_ticker)
+                    {
                         let bal = kalshi_position_contracts(lp);
                         if bal <= 0.001 {
                             info!("Stale Kalshi position {} resolved/closed. Marking ResolvedConfirmed.", open_positions[j].kalshi_ticker);
@@ -1351,7 +1417,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     } else {
                         // Not in portfolio -> resolved
-                        info!("Stale Kalshi position {} not in portfolio. Marking ResolvedConfirmed.", open_positions[j].kalshi_ticker);
+                        info!(
+                            "Stale Kalshi position {} not in portfolio. Marking ResolvedConfirmed.",
+                            open_positions[j].kalshi_ticker
+                        );
                         open_positions[j].shares = 0.0;
                         open_positions[j].notional_usdc = 0.0;
                         open_positions[j].state = PositionState::ResolvedConfirmed;
@@ -1361,7 +1430,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     // Polymarket
-                    let bal = poly_client.get_balance(open_positions[j].pm_token_id()).await.unwrap_or(open_positions[j].shares);
+                    let bal = poly_client
+                        .get_balance(open_positions[j].pm_token_id())
+                        .await
+                        .unwrap_or(open_positions[j].shares);
                     let close_epsilon = position_close_epsilon(&open_positions[j]);
                     if bal <= close_epsilon {
                         info!("Stale Polymarket position {} resolved/closed. Marking ResolvedConfirmed.", open_positions[j].pm_token_id());
@@ -1388,10 +1460,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pruned = prune_terminal_positions(&mut open_positions);
         if pruned > 0 {
-            info!("STATE COMPACT | pruned {} terminal zero-share positions.", pruned);
+            info!(
+                "STATE COMPACT | pruned {} terminal zero-share positions.",
+                pruned
+            );
             save_state(&open_positions);
         }
-        
+
         // --- EVALUATE SAFE MODE ---
         safe_mode_active = open_positions.iter().any(|pos| {
             matches!(
@@ -1451,7 +1526,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut threshold =
                 arbitrage_hammer::entry_engine::distance_threshold_for(&symbol, vol_metrics.state);
-            let pct_threshold = arbitrage_hammer::entry_engine::distance_threshold_pct_for(&symbol, vol_metrics.state);
+            let pct_threshold = arbitrage_hammer::entry_engine::distance_threshold_pct_for(
+                &symbol,
+                vol_metrics.state,
+            );
             if pct_threshold > 0.0 {
                 threshold = threshold.max(binance_open * pct_threshold);
             }
@@ -1493,29 +1571,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // ── STOP-FAILED ESCALATING RETRY ──────────────────────────────
                 // Positions stuck in StopFailed are retried every tick with
                 // increasing aggression so they NEVER bleed to zero silently.
-                if matches!(pos.state, PositionState::RecoveryPending | PositionState::ExitFailedZeroFill)
-                    && !pos.is_hedge
+                if matches!(
+                    pos.state,
+                    PositionState::RecoveryPending | PositionState::ExitFailedZeroFill
+                ) && !pos.is_hedge
                 {
                     // Count how many times we have already failed by inspecting last_error.
                     let fail_count = pos
                         .last_error
                         .as_deref()
                         .and_then(|e| {
-                            e.split("attempt#").nth(1).and_then(|s| s.parse::<u32>().ok())
+                            e.split("attempt#")
+                                .nth(1)
+                                .and_then(|s| s.parse::<u32>().ok())
                         })
                         .unwrap_or(0);
 
                     // Fetch live price for this venue
                     let (sf_ask, sf_bid) = if pos.venue == Venue::Polymarket {
                         let ask = if pos.buy_yes {
-                            api::get_best_ask(&http_client, &pos.pm_market_id, &pos.pm_yes_token).await.unwrap_or(0.0)
+                            api::get_best_ask(&http_client, &pos.pm_market_id, &pos.pm_yes_token)
+                                .await
+                                .unwrap_or(0.0)
                         } else {
-                            api::get_best_ask(&http_client, &pos.pm_market_id, &pos.pm_no_token).await.unwrap_or(0.0)
+                            api::get_best_ask(&http_client, &pos.pm_market_id, &pos.pm_no_token)
+                                .await
+                                .unwrap_or(0.0)
                         };
                         let bid = if pos.buy_yes {
-                            api::get_best_bid(&http_client, &pos.pm_yes_token).await.unwrap_or(0.0)
+                            api::get_best_bid(&http_client, &pos.pm_yes_token)
+                                .await
+                                .unwrap_or(0.0)
                         } else {
-                            api::get_best_bid(&http_client, &pos.pm_no_token).await.unwrap_or(0.0)
+                            api::get_best_bid(&http_client, &pos.pm_no_token)
+                                .await
+                                .unwrap_or(0.0)
                         };
                         (ask, bid)
                     } else {
@@ -1523,8 +1613,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .get_outcome_top_of_book(&pos.kalshi_ticker)
                             .await
                             .unwrap_or(((None, None), (None, None)));
-                        let ask = if pos.buy_yes { ky_ask.unwrap_or(0.0) } else { kn_ask.unwrap_or(0.0) };
-                        let bid = if pos.buy_yes { ky_bid.unwrap_or(0.0) } else { kn_bid.unwrap_or(0.0) };
+                        let ask = if pos.buy_yes {
+                            ky_ask.unwrap_or(0.0)
+                        } else {
+                            kn_ask.unwrap_or(0.0)
+                        };
+                        let bid = if pos.buy_yes {
+                            ky_bid.unwrap_or(0.0)
+                        } else {
+                            kn_bid.unwrap_or(0.0)
+                        };
                         (ask, bid)
                     };
                     let sf_ref = if sf_bid > 0.0 { sf_bid } else { sf_ask };
@@ -1555,7 +1653,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             pos.shares,
                             exit_price,
                             paper_mode,
-                        ).await
+                        )
+                        .await
                     } else {
                         close_kalshi_position(
                             &kalshi_client,
@@ -1564,12 +1663,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             pos.shares,
                             exit_price,
                             paper_mode,
-                        ).await
+                        )
+                        .await
                     };
 
                     match sf_res {
                         Ok(fill) => {
-                            match reconcile_close_fill(&mut open_positions[j], &fill, "STOP-FAILED") {
+                            match reconcile_close_fill(&mut open_positions[j], &fill, "STOP-FAILED")
+                            {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     let proceeds = fill.shares_sold * fill.fill_price;
@@ -1586,7 +1687,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                                 }
                                 Err(e) => {
-                                    warn!("RECOVERY FAILED zero/unconfirmed fill | coin={} error={}", pos.coin, e);
+                                    warn!(
+                                        "RECOVERY FAILED zero/unconfirmed fill | coin={} error={}",
+                                        pos.coin, e
+                                    );
                                     safe_mode_active = true;
                                     if let Some(bot) = telegram_bot.as_ref() {
                                         bot.send_message(&format!(
@@ -1604,22 +1708,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             capital_manager.add(&pos.venue_platform(), proceeds);
                             let profit = proceeds - pos.notional_usdc;
                             let is_win = proceeds >= pos.notional_usdc;
-                            
+
                             error!(
                                 "STOP-FAILED RECOVERED | coin={} ticker={} exit_price={:.4} proceeds={:.4} profit={:.4} after {} attempts",
                                 pos.coin, pos.kalshi_ticker, fill.fill_price, proceeds, profit, fail_count + 1
                             );
-                            
+
                             if let Some(bot) = telegram_bot.as_ref() {
                                 let msg = format!(
                                     "✅ *CIERRE RECUPERADO* (intento #{})\nActivo: `{}`\nResultado: {}\nEntrada: `{:.4}` | Salida: `{:.4}`\nInversion: `${:.2}` | Retorno: `${:.2}`\nBeneficio: *${:+.2}*\n\n💰 *Cartera {:?}:* `${:.2}`",
-                                    fail_count + 1, 
-                                    pos.coin, 
+                                    fail_count + 1,
+                                    pos.coin,
                                     if is_win { "🟢 GANANCIA" } else { "🔴 PERDIDA" },
-                                    pos.entry_price, 
-                                    fill.fill_price, 
-                                    pos.notional_usdc, 
-                                    proceeds, 
+                                    pos.entry_price,
+                                    fill.fill_price,
+                                    pos.notional_usdc,
+                                    proceeds,
                                     profit,
                                     pos.venue_platform(),
                                     capital_manager.balance(&pos.venue_platform())
@@ -1724,7 +1828,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         match res {
                             Ok(fill) => {
-                                match reconcile_close_fill(&mut open_positions[j], &fill, "BINANCE-RETRACE") {
+                                match reconcile_close_fill(
+                                    &mut open_positions[j],
+                                    &fill,
+                                    "BINANCE-RETRACE",
+                                ) {
                                     Ok(true) => {}
                                     Ok(false) => {
                                         let proceeds = fill.shares_sold * fill.fill_price;
@@ -1809,7 +1917,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     match res {
                         Ok(fill) => {
-                            match reconcile_close_fill(&mut open_positions[j], &fill, "TAKE-PROFIT") {
+                            match reconcile_close_fill(&mut open_positions[j], &fill, "TAKE-PROFIT")
+                            {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     let proceeds = fill.shares_sold * fill.fill_price;
@@ -1826,7 +1935,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                                 }
                                 Err(e) => {
-                                    warn!("TAKE-PROFIT close zero/unconfirmed | coin={} error={}", pos.coin, e);
+                                    warn!(
+                                        "TAKE-PROFIT close zero/unconfirmed | coin={} error={}",
+                                        pos.coin, e
+                                    );
                                     safe_mode_active = true;
                                     if let Some(bot) = telegram_bot.as_ref() {
                                         bot.send_message(&format!(
@@ -1925,7 +2037,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                                 }
                                 Err(e) => {
-                                    warn!("HARD-SL close zero/unconfirmed | coin={} error={}", pos.coin, e);
+                                    warn!(
+                                        "HARD-SL close zero/unconfirmed | coin={} error={}",
+                                        pos.coin, e
+                                    );
                                     safe_mode_active = true;
                                     save_state(&open_positions);
                                     j += 1;
@@ -2254,6 +2369,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                         .unwrap_or(0.0)
                 };
+                if pm_ask > 0.0 {
+                    poly_425_guard.record_orderbook_seen(&twin.kalshi_ticker);
+                    if poly_425_guard.is_latency_high(&twin.kalshi_ticker) {
+                        warn!(
+                            "CLOB LATENCY HIGH {} | ticker={} last_score_ms>2000; treating visible Polymarket price as stale-risk",
+                            twin.coin, twin.kalshi_ticker
+                        );
+                    }
+                }
                 let ((ky_ask, kn_ask), (_ky_bid, _kn_bid)) = kalshi_client
                     .get_outcome_top_of_book(&twin.kalshi_ticker)
                     .await
@@ -2348,6 +2472,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
 
+                    if selection.platform == Platform::Polymarket {
+                        match poly_425_guard.before_polymarket_order(&twin.kalshi_ticker) {
+                            Poly425Decision::Allow => {}
+                            Poly425Decision::Cooldown { remaining_secs } => {
+                                scan_burned_blocked += 1;
+                                info!(
+                                    "ENTRY BLOCKED {} | Polymarket 425 cooldown active | ticker={} remaining={}s",
+                                    twin.coin, twin.kalshi_ticker, remaining_secs
+                                );
+                                continue;
+                            }
+                        }
+
+                        if poly_425_guard.is_orderbook_desynced(&twin.kalshi_ticker) {
+                            scan_burned_blocked += 1;
+                            warn!(
+                                "ENTRY BLOCKED {} | Polymarket orderbook desync detected | ticker={} window_ms>{}",
+                                twin.coin,
+                                twin.kalshi_ticker,
+                                std::env::var("POLY_CLOB_LATENCY_WINDOW_MS")
+                                    .unwrap_or_else(|_| "500".to_string())
+                            );
+                            continue;
+                        }
+                    }
+
                     let res = if selection.platform == Platform::Polymarket {
                         execute_polymarket_entry(
                             &http_client,
@@ -2376,6 +2526,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match res {
                         Ok(fill) => {
+                            if selection.platform == Platform::Polymarket {
+                                poly_425_guard.record_success(&twin.kalshi_ticker);
+                            }
                             capital_manager.deduct(&selection.platform, fill.notional_usdc);
                             open_positions.push(OpenPosition {
                                 twin_key: twin.kalshi_ticker.clone(),
@@ -2432,12 +2585,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "ENTRY FAILED {} | venue={} ask={:.3} error={}",
                                 twin.coin, selection.venue, selection.ask, e
                             );
-                            if let Some(bot) = telegram_bot.as_ref() {
-                                bot.send_message(&format!(
+                            let mut silent_telegram = false;
+                            if selection.platform == Platform::Polymarket && is_poly_425_error(&e) {
+                                let outcome = poly_425_guard.record_425(&twin.kalshi_ticker);
+                                silent_telegram = outcome.silent_telegram;
+                                warn!(
+                                    "POLY 425 GUARD {} | ticker={} consecutive={} cooldown={}s latency_score_ms={} silent={} killed_market={} kill_bot={}",
+                                    twin.coin,
+                                    twin.kalshi_ticker,
+                                    outcome.consecutive_425s,
+                                    outcome.cooldown_secs,
+                                    outcome.latency_score_ms,
+                                    outcome.silent_telegram,
+                                    outcome.killed_market,
+                                    outcome.kill_bot
+                                );
+                                if outcome.killed_market {
+                                    warn!(
+                                        "POLY 425 MARKET DEAD {} | ticker={} paused for {}s",
+                                        twin.coin, twin.kalshi_ticker, outcome.cooldown_secs
+                                    );
+                                }
+                                if outcome.kill_bot {
+                                    error!(
+                                        "POLY 425 KILL SWITCH | ticker={} exceeded consecutive 425 limit; exiting bot",
+                                        twin.kalshi_ticker
+                                    );
+                                    if let Some(bot) = telegram_bot.as_ref() {
+                                        bot.send_message(&format!(
+                                            "*BOT DETENIDO POR 425*\nActivo: `{}`\nTicker: `{}`\nConsecutivos: `{}`\nError: `{}`",
+                                            twin.coin,
+                                            twin.kalshi_ticker,
+                                            outcome.consecutive_425s,
+                                            e
+                                        ))
+                                        .await;
+                                    }
+                                    std::process::exit(42);
+                                }
+                            }
+
+                            if !silent_telegram {
+                                if let Some(bot) = telegram_bot.as_ref() {
+                                    bot.send_message(&format!(
                                 "*Entrada fallida*\nActivo: `{}`\nVenue: `{}`\nAsk: `{:.3}`\nError: `{}`",
                                 twin.coin, selection.venue, selection.ask, e
                             ))
                             .await;
+                                }
                             }
                         }
                     }
