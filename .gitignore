@@ -4,3 +4,10 @@
 *.log
 *.out.log
 *.err.log
+open_positions.json
+bot.lock
+__pycache__/
+.vscode/
+.agent/
+scratch/
+redeemable.json
