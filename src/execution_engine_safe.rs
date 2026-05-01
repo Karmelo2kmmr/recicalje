@@ -381,4 +381,79 @@ impl ExecutionEngine {
             let _ = cancel_protective_order(client, &did).await;
         }
     }
+
+    /// Capital Protection Engine: Execute an iterative safe exit that guarantees
+    /// the position is closed, using emergency ladders and market dumps if necessary.
+    pub async fn execute_safe_exit(
+        &mut self,
+        protection_engine: &mut crate::risk_engine::CapitalProtectionEngine,
+        client: &reqwest::Client,
+        token_id: &str,
+        target_price: f64,
+    ) -> Result<crate::api::ExecutorResponse, Box<dyn std::error::Error>> {
+        let start_time = std::time::Instant::now();
+        let mut target = target_price;
+        
+        loop {
+            if protection_engine.is_safe_mode {
+                return Err("SAFE_MODE_ENGAGED".into());
+            }
+
+            // Check actual balance using the python bridge logic
+            let actual_shares = match crate::api::get_actual_balance(token_id).await {
+                Ok(bal) => bal,
+                Err(_) => return Err("Failed to reconcile balance during safe exit".into()),
+            };
+
+            if actual_shares == 0.0 {
+                return Ok(crate::api::ExecutorResponse {
+                    order_id: "closed".to_string(),
+                    fill_price: Some(target),
+                    shares: 0.0,
+                    reliable: true,
+                    attempts: 1,
+                });
+            }
+
+            if start_time.elapsed().as_secs() > protection_engine.exit_timeout_secs {
+                log::warn!("🚨 TIMEOUT: Initiating Emergency Market Dump");
+                return self.emergency_dump(client, token_id, actual_shares).await;
+            }
+
+            // Normal Attempt
+            match crate::api::place_fak_sell(client, token_id, actual_shares, target).await {
+                Ok(resp) => {
+                    let filled = resp.shares; // The python bridge returns 'shares' which is the filled amount
+                    if filled < actual_shares && filled > 0.0 {
+                        log::warn!("PARTIAL FILL: Sold {:.2} out of {:.2}", filled, actual_shares);
+                        continue;
+                    }
+                    return Ok(crate::api::ExecutorResponse {
+                        order_id: resp.order_id,
+                        fill_price: Some(target),
+                        shares: filled,
+                        reliable: true,
+                        attempts: 1,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Exit attempt failed: {}. Laddering down.", e);
+                    target = (target - 0.01).max(Self::hard_sl_exit_floor());
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+
+    async fn emergency_dump(&self, client: &reqwest::Client, token_id: &str, shares: f64) -> Result<crate::api::ExecutorResponse, Box<dyn std::error::Error>> {
+        log::error!("🗑️ EXECUTING EMERGENCY MARKET DUMP FOR {} SHARES", shares);
+        let resp = crate::api::place_fak_sell(client, token_id, shares, 0.01).await?;
+        Ok(crate::api::ExecutorResponse {
+            order_id: resp.order_id,
+            fill_price: Some(0.01),
+            shares: resp.shares,
+            reliable: true,
+            attempts: 1,
+        })
+    }
 }

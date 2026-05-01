@@ -7,6 +7,8 @@ pub enum PositionState {
     InPosition,
     Exiting,
     RecoveryScanning,
+    DesyncMonitoring, // Mithos Omega Anomaly state
+    EmergencyExiting, // Capital Protection Engine state
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

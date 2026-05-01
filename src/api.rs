@@ -40,12 +40,31 @@ async fn handle_critical_error(msg: &str) {
     }
 
     if count >= MAX_CONSECUTIVE_ERRORS {
-        if let Some(b) = GLOBAL_BOT.get() {
-            let kill_msg = "💀 *KILL SWITCH ACTIVADO* 💀\n\nEl bot se ha detenido automáticamente tras 3 fallos críticos consecutivos para evitar pérdidas catastróficas fatales.\n\n⚠️ *Causa probable:* Bloqueo de IP (Error 403 / Geoblock) o problema de credenciales.";
-            b.send_message(kill_msg).await;
+        // SAFETY: Only kill the process if KILL_SWITCH_ENABLED=true is explicitly set.
+        // Default is false because killing with open positions causes unmanaged losses.
+        let kill_enabled = std::env::var("KILL_SWITCH_ENABLED")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        if kill_enabled {
+            if let Some(b) = GLOBAL_BOT.get() {
+                let kill_msg = "💀 *KILL SWITCH ACTIVADO* 💀\n\nEl bot se ha detenido automáticamente tras 3 fallos críticos consecutivos para evitar pérdidas catastróficas fatales.\n\n⚠️ *Causa probable:* Bloqueo de IP (Error 403 / Geoblock) o problema de credenciales.";
+                b.send_message(kill_msg).await;
+            }
+            log::error!("💀 KILL SWITCH ACTIVATED 💀 3 consecutive critical API errors. Terminating bot to prevent catastrophic losses.");
+            std::process::exit(1);
+        } else {
+            log::error!(
+                "🚨 {} consecutive critical errors — KILL SWITCH is DISABLED (set KILL_SWITCH_ENABLED=true to enable). Bot will keep retrying to protect open positions.",
+                count
+            );
+            if let Some(b) = GLOBAL_BOT.get() {
+                b.send_message(&format!(
+                    "🚨 *{} ERRORES CRÍTICOS CONSECUTIVOS*\nEl bot sigue activo para proteger posiciones abiertas.\nRevisa la conexión o credenciales urgentemente.",
+                    count
+                )).await;
+            }
         }
-        log::error!("💀 KILL SWITCH ACTIVATED 💀 3 consecutive critical API errors. Terminating bot to prevent catastrophic losses.");
-        std::process::exit(1);
     }
 }
 
@@ -108,6 +127,10 @@ pub struct Market {
     pub id: String,
     pub question: String,
     pub slug: Option<String>,
+    #[serde(rename = "endDate")]
+    pub end_date: Option<String>,
+    #[serde(rename = "startDate")]
+    pub start_date: Option<String>,
     #[serde(rename = "outcomePrices")]
     pub outcome_prices: Option<String>,
     #[serde(rename = "clobTokenIds")]
@@ -245,12 +268,12 @@ pub async fn fetch_polymarket_price_to_beat(
     parse_price_to_beat_from_html(&html, slug)
         .or_else(|| parse_open_price_from_html(&html, slug))
         .ok_or_else(|| {
-        format!(
-            "Could not parse Price to Beat from event page for slug {}",
-            slug
-        )
-        .into()
-    })
+            format!(
+                "Could not parse Price to Beat from event page for slug {}",
+                slug
+            )
+            .into()
+        })
 }
 
 #[derive(Deserialize, Debug)]
@@ -307,13 +330,16 @@ pub async fn get_active_markets(
     let url = format!("{}/markets", GAMMA_URL);
     let tag_id = std::env::var("TAG_ID").unwrap_or("102467".to_string());
 
-    let params = [
-        ("tag_id", tag_id.as_str()),
+    let mut params = vec![
         ("closed", "false"),
         ("limit", "500"),
         ("order", "volume24hr"),
         ("ascending", "false"),
     ];
+
+    if tag_id != "ALL" {
+        params.push(("tag_id", &tag_id));
+    }
 
     let builder = client.get(&url).query(&params);
     let resp = send_with_retry(builder).await?;
@@ -327,6 +353,7 @@ pub async fn get_active_markets(
     debug!("Total markets fetched from Gamma: {}", fetched_total);
 
     let re = Regex::new(r"(?i)(\d{1,2}:\d{2})\s*(AM|PM)?").unwrap();
+    debug!("Scanning with TAG_ID={} at {}", tag_id, now);
 
     let filtered: Vec<Market> = markets
         .into_iter()
@@ -335,16 +362,16 @@ pub async fn get_active_markets(
             let is_near = is_market_timing_near(&m.question, &re, now);
 
             if !is_crypto {
-                // debug!("Not Crypto 15m: {}", m.question);
                 return false;
             }
 
+            // DIAGNÓSTICO: Ver qué mercados pasan el filtro de crypto pero fallan el de tiempo
             if !is_near {
                 debug!("Market {} IS CRYPTO 15m but NOT NEAR timing.", m.question);
                 return false;
             }
 
-            info!("­ƒôí Market Detected: {}", m.question);
+            info!("💎 Market Linked: {}", m.question);
             true
         })
         .collect();
@@ -361,11 +388,6 @@ pub async fn get_active_markets(
 
 pub fn utc_to_new_york_time(dt: DateTime<Utc>) -> DateTime<FixedOffset> {
     dt.with_timezone(&New_York).fixed_offset()
-}
-
-pub fn to_eastern_time(dt: DateTime<Local>) -> DateTime<FixedOffset> {
-    use chrono::{TimeZone, Utc};
-    dt.with_timezone(&Utc).with_timezone(&New_York).fixed_offset()
 }
 
 fn is_market_timing_near(title: &str, re: &Regex, now: DateTime<FixedOffset>) -> bool {
@@ -449,9 +471,18 @@ fn is_market_timing_near(title: &str, re: &Regex, now: DateTime<FixedOffset>) ->
         end_abs += 1440;
     }
 
-    // Relaxed timing: Allow if we are within the window OR it starts in the next 15 minutes
-    (current_mins >= start_abs && current_mins < end_abs) || 
-    (current_mins >= start_abs - 15 && current_mins < start_abs)
+    let is_near = (current_mins >= start_abs && current_mins < end_abs)
+        || (current_mins >= start_abs - 15 && current_mins < start_abs)
+        || (current_mins >= start_abs && current_mins < start_abs + 15);
+
+    if !is_near {
+        debug!(
+            "Timing mismatch for {}: current={} vs window=[{}-{}]",
+            title, current_mins, start_abs, end_abs
+        );
+    }
+
+    is_near
 }
 
 fn is_crypto_15m(title: &str, re: &Regex) -> bool {
@@ -490,43 +521,48 @@ fn is_crypto_15m(title: &str, re: &Regex) -> bool {
         }
     }
 
-    // 2. Time window check (15m markets)
-    let caps: Vec<_> = re.captures_iter(title).collect();
-    if caps.len() < 2 {
-        return false;
+    // 2. CHECK FOR 15m MARKERS (Ultra-Flexible)
+    let has_15m_tag = t.contains("15m") || t.contains("15 min") || t.contains("15-min");
+
+    // Si tiene el tag de 15m explícito, lo aceptamos
+    if has_15m_tag {
+        debug!("Market matched via 15m tag: {}", title);
+        return true;
     }
 
-    let to_mixed_minutes = |c: &regex::Captures| -> Option<i32> {
-        let time_str = c.get(1)?.as_str();
-        let amp_str = c.get(2).map(|m| m.as_str().to_uppercase());
-        let parts: Vec<&str> = time_str.split(':').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        let mut h: i32 = parts[0].parse().ok()?;
-        let m: i32 = parts[1].parse().ok()?;
-        if let Some(amp) = amp_str {
-            if amp == "PM" && h != 12 {
-                h += 12;
+    // Si no tiene el tag, probamos con el regex de las dos horas
+    let caps: Vec<_> = re.captures_iter(title).collect();
+    if caps.len() >= 2 {
+        let to_mixed_minutes = |c: &regex::Captures| -> Option<i32> {
+            let time_str = c.get(1)?.as_str();
+            let amp_str = c.get(2).map(|m| m.as_str().to_uppercase());
+            let parts: Vec<&str> = time_str.split(':').collect();
+            if parts.len() != 2 {
+                return None;
             }
-            if amp == "AM" && h == 12 {
-                h = 0;
+            let mut h: i32 = parts[0].parse().ok()?;
+            let m: i32 = parts[1].parse().ok()?;
+            if let Some(amp) = amp_str {
+                if amp == "PM" && h != 12 {
+                    h += 12;
+                }
+                if amp == "AM" && h == 12 {
+                    h = 0;
+                }
             }
+            Some(h * 60 + m)
+        };
+
+        let t1 = to_mixed_minutes(&caps[caps.len() - 2]);
+        let t2 = to_mixed_minutes(&caps[caps.len() - 1]);
+
+        if let (Some(v1), Some(v2)) = (t1, t2) {
+            let diff = (v2 - v1).rem_euclid(1440);
+            return diff >= 14 && diff <= 16;
         }
-        Some(h * 60 + m)
-    };
+    }
 
-    let t1 = match to_mixed_minutes(&caps[caps.len() - 2]) {
-        Some(v) => v,
-        None => return false,
-    };
-    let t2 = match to_mixed_minutes(&caps[caps.len() - 1]) {
-        Some(v) => v,
-        None => return false,
-    };
-    let diff = (t2 - t1).rem_euclid(1440);
-
-    diff >= 14 && diff <= 16
+    false
 }
 
 pub async fn get_clob_full_prices(
@@ -865,15 +901,31 @@ async fn call_executor(args: &[&str]) -> Result<ExecutorResponse, Box<dyn Error>
 
     let python_cmd = if cfg!(windows) { "python" } else { "python3" };
 
-    let output = match tokio::process::Command::new(python_cmd)
-        .arg(&exec)
-        .args(args)
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
+    // P0 FIX: 20-second hard timeout prevents sell orders blocking indefinitely
+    // while the market moves against open positions.
+    let cmd_result = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(python_cmd)
+            .arg(&exec)
+            .args(args)
+            .output(),
+    )
+    .await;
+
+    let output = match cmd_result {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             let msg = format!("Failed to launch Python executor ({}): {}", python_cmd, e);
+            handle_critical_error(&msg).await;
+            return Err(msg.into());
+        }
+        Err(_) => {
+            let cmd_name = args.first().copied().unwrap_or("unknown");
+            let msg = format!(
+                "Python executor TIMED OUT after 20s | cmd={} — position may be unmanaged",
+                cmd_name
+            );
+            error!("{}", msg);
             handle_critical_error(&msg).await;
             return Err(msg.into());
         }
@@ -912,7 +964,7 @@ async fn call_executor(args: &[&str]) -> Result<ExecutorResponse, Box<dyn Error>
     };
 
     if parsed["status"].as_str() == Some("ok") {
-        reset_critical_error(); // Success, network is completely fine
+        reset_critical_error();
 
         let order_id = parsed["order_id"].as_str().unwrap_or("unknown").to_string();
 
@@ -921,7 +973,6 @@ async fn call_executor(args: &[&str]) -> Result<ExecutorResponse, Box<dyn Error>
         if shares == 0.0 {
             shares = parsed["shares_ordered"].as_f64().unwrap_or(0.0);
         }
-        // Check original field names for backward compatibility
         if shares == 0.0 {
             shares = parsed["shares_sold"].as_f64().unwrap_or(0.0);
         }
@@ -932,9 +983,33 @@ async fn call_executor(args: &[&str]) -> Result<ExecutorResponse, Box<dyn Error>
             shares = parsed["actual_balance"].as_f64().unwrap_or(0.0);
         }
 
+        // P0 FIX: Detect silent zero-fill on sell commands.
+        // status:"ok" with shares=0 means the exchange accepted the order
+        // but filled nothing. Position is still open — treat as failure.
+        let is_sell_cmd = args
+            .first()
+            .map(|a| *a == "sell" || *a == "sell_fak")
+            .unwrap_or(false);
+        if is_sell_cmd && shares == 0.0 {
+            error!(
+                "ZERO-FILL SELL DETECTED: status:ok but 0 shares confirmed | order_id={} | POSITION MAY STILL BE OPEN",
+                order_id
+            );
+            return Err(format!(
+                "Sell zero-fill: status:ok but no shares sold (order_id={}). Position still open.",
+                order_id
+            ).into());
+        }
+
         let fill_price = parsed["average_fill_price"].as_f64();
-        let reliable = parsed["reliable"].as_bool().unwrap_or(true); // Default to true if not specified
+        // P0 FIX: Default reliable=false. Only trust balance data the daemon explicitly marks reliable.
+        let reliable = parsed["reliable"].as_bool().unwrap_or(false);
         let attempts = parsed["attempts"].as_u64().unwrap_or(1) as u32;
+
+        info!(
+            "EXECUTOR OK | cmd={} | order_id={} | shares={:.6} | fill_price={:?} | reliable={}",
+            args.first().copied().unwrap_or("?"), order_id, shares, fill_price, reliable
+        );
 
         Ok(ExecutorResponse {
             order_id,
@@ -1466,15 +1541,13 @@ pub async fn place_market_sell(
     shares: f64,
     limit_price: f64,
 ) -> Result<ExecutorResponse, Box<dyn Error>> {
-    let effective_limit_price = if limit_price <= 0.011 {
-        std::env::var("HARD_SL_EXIT_FLOOR")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map(|v| v.clamp(0.01, 0.99))
-            .unwrap_or(limit_price)
-    } else {
-        limit_price
-    };
+    // P0 FIX: Previous code overrode limit_price=0.01 (nuclear sell) to HARD_SL_EXIT_FLOOR=0.47,
+    // which in an illiquid market would never fill — defeating the last-resort mechanism.
+    // Now: respect the caller's intent exactly, only clamp to a valid range.
+    let effective_limit_price = limit_price.clamp(0.01, 0.99);
+    if limit_price < 0.02 {
+        warn!("NUCLEAR SELL: limit_price={:.4} — selling at floor to guarantee exit", effective_limit_price);
+    }
 
     if is_live_mode() {
         let shares_str = format!("{:.6}", shares);
@@ -1505,4 +1578,64 @@ pub async fn place_market_sell(
             attempts: 1,
         })
     }
+}
+
+pub fn extract_strike(text: &str) -> Option<f64> {
+    let re = regex::Regex::new(r"\$([\d,]+(?:\.\d+)?)").unwrap();
+    if let Some(cap) = re.captures(text) {
+        let val_str = cap.get(1)?.as_str().replace(",", "");
+        return val_str.parse().ok();
+    }
+    None
+}
+
+pub fn to_total_mins(text: &str) -> Option<i32> {
+    let re_ampm = regex::Regex::new(r"(\d{1,2}):(\d{2})\s*(AM|PM)").unwrap();
+    let re_24h = regex::Regex::new(r"(\d{1,2}):(\d{2})").unwrap();
+
+    if let Some(cap) = re_ampm.captures(text) {
+        let mut h: i32 = cap.get(1)?.as_str().parse().ok()?;
+        let m: i32 = cap.get(2)?.as_str().parse().ok()?;
+        let ampm = cap.get(3)?.as_str().to_uppercase();
+        if ampm == "PM" && h < 12 {
+            h += 12;
+        }
+        if ampm == "AM" && h == 12 {
+            h = 0;
+        }
+        return Some(h * 60 + m);
+    } else if let Some(cap) = re_24h.captures(text) {
+        let h: i32 = cap.get(1)?.as_str().parse().ok()?;
+        let m: i32 = cap.get(2)?.as_str().parse().ok()?;
+        return Some(h * 60 + m);
+    }
+    None
+}
+
+pub fn extract_window_times(title: &str) -> Option<(i32, i32)> {
+    // Title example: "XRP Up or Down - April 27, 3:30PM-3:45PM ET"
+    let parts: Vec<&str> = title.split(',').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let time_part = parts[1]; // " 3:30PM-3:45PM ET"
+    let times: Vec<&str> = time_part.split('-').collect();
+    if times.len() < 2 {
+        return None;
+    }
+
+    let start = to_total_mins(times[0])?;
+    let end = to_total_mins(times[1])?;
+    Some((start, end))
+}
+
+pub fn to_eastern_time(dt: DateTime<Local>) -> DateTime<chrono_tz::Tz> {
+    dt.with_timezone(&chrono_tz::America::New_York)
+}
+
+pub fn extract_kalshi_window_start(open_time_iso: &str) -> Option<i32> {
+    // ISO format: 2024-04-28T00:00:00Z
+    let dt = DateTime::parse_from_rfc3339(open_time_iso).ok()?;
+    let dt_et = dt.with_timezone(&chrono_tz::America::New_York);
+    Some(dt_et.hour() as i32 * 60 + dt_et.minute() as i32)
 }

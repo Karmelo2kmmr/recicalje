@@ -33,7 +33,7 @@ impl ExecutionEngine {
     }
 
     fn hard_sl_exit_floor() -> f64 {
-        env_f64("HARD_SL_EXIT_FLOOR", 0.61).clamp(0.61, 0.99)
+        env_f64("HARD_SL_EXIT_FLOOR", 0.47).clamp(0.01, 0.99)
     }
 
     fn allow_hard_sl_market_dump() -> bool {
@@ -106,6 +106,17 @@ impl ExecutionEngine {
             };
         }
 
+        // P0 FIX: If target_price is 0.0 (empty orderbook), the formula
+        // (target_price - 0.01).max(0.10) = 0.10 which causes a massive unnecessary loss.
+        // Refuse to sell with a zero reference price — caller must retry with a valid price.
+        if target_price <= 0.0 {
+            error!(
+                "close_position rejected: target_price={:.4} is invalid (empty orderbook?) for reason={}",
+                target_price, reason
+            );
+            return Err("close_position: target_price is 0.0 — refusing to sell at floor. Retry with valid market price.".into());
+        }
+
         let floor_price = (target_price - 0.01).max(0.10);
         let resp = place_floor_sell(client, token_id, on_chain_bal, floor_price).await;
 
@@ -131,13 +142,28 @@ impl ExecutionEngine {
         dca_id: Option<String>,
         client: &reqwest::Client,
     ) {
+        // P1 FIX: Previously used `let _ =` which silently swallowed cancel failures.
+        // A failed cancel leaves a GTC order live — it can fill later and create a
+        // second unintended sell, over-selling more shares than held.
         if let Some(pid) = protective_id {
             info!("Cancelling protective order {} for {}", pid, id);
-            let _ = cancel_protective_order(client, &pid).await;
+            match cancel_protective_order(client, &pid).await {
+                Ok(status) => info!("Protective order {} cancelled: final_status={}", pid, status),
+                Err(e) => error!(
+                    "CANCEL FAILED for protective order {} on {} — order may still be live: {}",
+                    pid, id, e
+                ),
+            }
         }
         if let Some(did) = dca_id {
             info!("Cancelling DCA order {} for {}", did, id);
-            let _ = cancel_protective_order(client, &did).await;
+            match cancel_protective_order(client, &did).await {
+                Ok(status) => info!("DCA order {} cancelled: final_status={}", did, status),
+                Err(e) => error!(
+                    "CANCEL FAILED for DCA order {} on {} — order may still be live: {}",
+                    did, id, e
+                ),
+            }
         }
     }
 }

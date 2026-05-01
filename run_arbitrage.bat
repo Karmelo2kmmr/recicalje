@@ -1,7 +1,10 @@
 @echo off
 set RUST_LOG=info
 cd /d "C:\Users\daniel\OneDrive\Desktop\bots poly\arbitrage_hammer"
-echo Starting Arbitrage Hammer in background...
-start /B cargo run --release > arbitrage_hammer.log 2>&1
-echo Bot is running. Check arbitrage_hammer.log for updates.
+echo Building release binary...
+cargo build --release
+if errorlevel 1 exit /b 1
+echo Starting Arbitrage Hammer and CLOB daemon...
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\launch_all.ps1"
+echo Check arbitrage_hammer.err.log and clob_daemon.err.log for updates.
 pause

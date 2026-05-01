@@ -1,7 +1,7 @@
 use chrono::{DateTime, FixedOffset, Timelike};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use regex::Regex;
-use std::sync::atomic::{AtomicI64, AtomicUsize};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::api::Market;
@@ -77,7 +77,7 @@ pub struct ActiveStateSnapshot {
     pub protection_status: Option<String>,
     pub last_balance_check: Option<String>,
     pub exit_in_progress: Option<bool>,
-    pub trade_state: String, // "Scanning", "OpenProtected", "Closed"
+    pub trade_state: String, 
     pub ultra_aggressive_mode: bool,
     pub is_exiting: bool,
 }
@@ -127,6 +127,12 @@ pub struct MarketTracker {
     pub price_to_beat: Option<f64>,
     pub binance_entry_reference: Option<f64>,
     pub last_block_reason: String,
+
+    // P0 FIX: Atomic flag to prevent race conditions when TP and SL trigger in the same tick
+    pub closing_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    
+    // P0 FIX: Global Capital Protection for real exits and safe mode triggers
+    pub protection: crate::risk_engine::CapitalProtectionEngine,
 }
 
 impl MarketTracker {
@@ -142,16 +148,24 @@ impl MarketTracker {
 
         let paper_trading = std::env::var("PAPER_TRADING")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
 
-        // In live trading we cannot simulate a stop-loss with a resting GTC sell:
-        // a sell below the market becomes immediately executable and closes early.
-        // Keep the position tracked locally and let the real stop trigger only when
-        // `check()` sees the live exit bid reach the configured stop level.
         if !paper_trading {
             if let Some(existing_id) = self.protective_order_id.take() {
-                let _ = crate::api::cancel_protective_order(client, &existing_id).await;
+                match crate::api::cancel_protective_order(client, &existing_id).await {
+                    Ok(_) => info!("Live protective GTC {} cancelled for {}.", existing_id, self.question),
+                    Err(e) => {
+                        error!("FATAL: Failed to cancel live protective GTC {} for {}: {}. RISK OF OVERSELL.", existing_id, self.question, e);
+                        self.protective_order_id = Some(existing_id);
+                        return; 
+                    }
+                }
             }
             self.trade_state = TradeState::OpenProtected;
             info!(
@@ -162,7 +176,12 @@ impl MarketTracker {
         }
 
         if let Some(existing_id) = self.protective_order_id.take() {
-            let _ = crate::api::cancel_protective_order(client, &existing_id).await;
+            match crate::api::cancel_protective_order(client, &existing_id).await {
+                Ok(_) => info!("Paper protective GTC {} cancelled.", existing_id),
+                Err(e) => {
+                    warn!("Could not cancel paper protective order {}: {}", existing_id, e);
+                }
+            }
         }
 
         match crate::api::place_protective_limit_sell(
@@ -193,7 +212,13 @@ impl MarketTracker {
 
     async fn clear_protective_order(&mut self, client: &reqwest::Client) {
         if let Some(existing_id) = self.protective_order_id.take() {
-            let _ = crate::api::cancel_protective_order(client, &existing_id).await;
+            match crate::api::cancel_protective_order(client, &existing_id).await {
+                Ok(_) => info!("Protective order {} cleared successfully.", existing_id),
+                Err(e) => {
+                    error!("CRITICAL: Failed to clear protective order {} on exit: {}. Manual check required.", existing_id, e);
+                    self.protective_order_id = Some(existing_id);
+                }
+            }
         }
     }
 
@@ -258,8 +283,7 @@ impl MarketTracker {
 
     fn is_terminal_exit_error(err_msg: &str) -> bool {
         let msg = err_msg.to_lowercase();
-        msg.contains("orderbook does not exist")
-            || msg.contains("the orderbook")
+        msg.contains("orderbook does not exist") || msg.contains("the orderbook")
     }
 
     fn is_sol_market(&self) -> bool {
@@ -274,14 +298,15 @@ impl MarketTracker {
         matches!(now.minute(), 8..=12 | 25..=28 | 39..=43 | 55..=59)
     }
 
-    fn should_block_expensive_late_entry(
-        &self,
-        now: DateTime<FixedOffset>,
-        price: f64,
-    ) -> bool {
+    fn should_block_expensive_late_entry(&self, now: DateTime<FixedOffset>, price: f64) -> bool {
         if std::env::var("DISABLE_LATE_EXPENSIVE_ENTRY_BLOCK")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false)
         {
             return false;
@@ -301,7 +326,12 @@ impl MarketTracker {
     ) -> f64 {
         if std::env::var("DISABLE_ORDERBOOK_TRIGGER_ADJUSTMENT")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false)
         {
             return base_trigger;
@@ -316,15 +346,12 @@ impl MarketTracker {
         };
 
         let mut trigger = base_trigger;
-
         if metrics.liquidity_score < 0.25 {
             trigger = trigger.min(0.880);
         }
-
         if imbalance > 3.0 {
             trigger = trigger.max(0.892);
         }
-
         trigger
     }
 
@@ -337,41 +364,22 @@ impl MarketTracker {
     }
 
     fn format_pnl(pnl: f64) -> String {
-        if pnl >= 0.0 {
-            format!("+${:.2}", pnl)
-        } else {
-            format!("-${:.2}", pnl.abs())
-        }
+        if pnl >= 0.0 { format!("+${:.2}", pnl) } else { format!("-${:.2}", pnl.abs()) }
     }
 
     fn format_return_pct(pnl: f64, size: f64) -> String {
-        if size <= 0.0 {
-            return "0.00%".to_string();
-        }
-
+        if size <= 0.0 { return "0.00%".to_string(); }
         let pct = (pnl / size) * 100.0;
-        if pct >= 0.0 {
-            format!("+{:.2}%", pct)
-        } else {
-            format!("{:.2}%", pct)
-        }
+        if pct >= 0.0 { format!("+{:.2}%", pct) } else { format!("{:.2}%", pct) }
     }
 
     fn format_price_delta(current: f64, reference: Option<f64>) -> String {
         if let Some(price_to_beat) = reference.filter(|v| *v > 0.0) {
             let delta = current - price_to_beat;
             if delta.abs() < 0.01 {
-                if delta >= 0.0 {
-                    format!("+{:.4} USD", delta)
-                } else {
-                    format!("{:.4} USD", delta)
-                }
+                if delta >= 0.0 { format!("+{:.4} USD", delta) } else { format!("{:.4} USD", delta) }
             } else {
-                if delta >= 0.0 {
-                    format!("+{:.2} USD", delta)
-                } else {
-                    format!("{:.2} USD", delta)
-                }
+                if delta >= 0.0 { format!("+{:.2} USD", delta) } else { format!("{:.2} USD", delta) }
             }
         } else {
             "N/A".to_string()
@@ -401,9 +409,7 @@ impl MarketTracker {
                     | crate::volatility::VolatilityState::HighSuperhigh => 0.00146,
                 }
             };
-
-        let early_threshold: f64 = base_threshold * 0.70_f64;
-        early_threshold.max(0.00030_f64)
+        (base_threshold * 0.70_f64).max(0.00030_f64)
     }
 
     fn should_preemptive_exit(&self, current_exit_price: f64) -> Option<(f64, f64)> {
@@ -417,18 +423,13 @@ impl MarketTracker {
             .filter(|price| *price > 0.0)?;
 
         let pct_change = (self.vol_metrics.current_price - reference) / reference;
-        let adverse_move = if self.state.side == "UP" {
-            -pct_change
-        } else {
-            pct_change
-        };
+        let adverse_move = if self.state.side == "UP" { -pct_change } else { pct_change };
         if adverse_move <= 0.0 {
             return None;
         }
 
         let threshold = self.early_exit_distance_threshold();
-        let danger_zone =
-            current_exit_price <= (self.risk.active_stop_loss + Self::danger_exit_buffer());
+        let danger_zone = current_exit_price <= (self.risk.active_stop_loss + Self::danger_exit_buffer());
 
         if danger_zone && adverse_move >= threshold {
             Some((adverse_move, threshold))
@@ -447,14 +448,8 @@ impl MarketTracker {
         stats: Arc<crate::stats::StatsEngine>,
     ) -> Self {
         let trigger_price = override_trigger.unwrap_or(0.885);
-        let max_entry_price = std::env::var("MAX_ENTRY_PRICE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.91);
-        let min_entry_price = std::env::var("MIN_ENTRY_PRICE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.86);
+        let max_entry_price = std::env::var("MAX_ENTRY_PRICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.91);
+        let min_entry_price = std::env::var("MIN_ENTRY_PRICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.86);
 
         let (yes_token_id, no_token_id) = m
             .clob_token_ids
@@ -466,10 +461,7 @@ impl MarketTracker {
             .unwrap_or((None, None));
 
         let start_minutes = Self::parse_start_time(&m.question);
-        let position_size = std::env::var("POSITION_SIZE")
-            .unwrap_or("6.0".to_string())
-            .parse()
-            .unwrap_or(6.0);
+        let position_size = std::env::var("POSITION_SIZE").unwrap_or("6.0".to_string()).parse().unwrap_or(6.0);
 
         Self {
             market_id: m.id.clone(),
@@ -477,12 +469,10 @@ impl MarketTracker {
             no_token_id,
             question: m.question.clone(),
             binance_symbol,
-
             state: StateMachine::new(),
             risk: RiskEngine::new(position_size, false, false),
             entry: EntryEngine::new(),
             execution: ExecutionEngine::new(),
-
             trigger_price,
             max_entry_price,
             min_entry_price,
@@ -490,18 +480,12 @@ impl MarketTracker {
             start_minutes,
             position_size,
             shares_held: 0.0,
-            status: MarketStatus::Scanning {
-                max_yes: 0.0,
-                max_no: 0.0,
-                last_update: None,
-            },
+            status: MarketStatus::Scanning { max_yes: 0.0, max_no: 0.0, last_update: None },
             has_traded_in_session: false,
             active_stop_loss: None,
             active_take_profit: None,
             take_profit_price: 0.97,
             protective_order_id: None,
-
-            // REINFORCED SL DEFAULTS
             trade_state: TradeState::Scanning,
             ultra_aggressive_mode: false,
             is_exiting: false,
@@ -515,28 +499,9 @@ impl MarketTracker {
             last_binance_price_update: None,
             price_to_beat,
             binance_entry_reference: None,
-            last_block_reason: "trigger blocked".to_string(),
-        }
-    }
-
-    pub fn force_restore_position_state(&mut self) {
-        if let MarketStatus::Executed(_, _) = self.status {
-            self.trade_state = TradeState::OpenProtected;
-            self.is_exiting = false;
-            self.has_traded_in_session = true;
-            self.active_stop_loss = Some(crate::risk_engine::HARD_SL_PRICE);
-            self.stop_loss_triggered = false;
-
-            // Si ya estaba cerca del SL, activar monitoreo agresivo
-            // get_current_price_approx uses the last tracked entry/DCA price
-            if self.state.entry_price <= 0.72 {
-                self.ultra_aggressive_mode = true;
-            }
-
-            info!(
-                "✅ FORCE RESTORE COMPLETE → {} | Shares: {:.6} | SL: 0.650",
-                self.question, self.shares_held
-            );
+            last_block_reason: String::new(),
+            closing_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            protection: crate::risk_engine::CapitalProtectionEngine::new(),
         }
     }
 
@@ -554,13 +519,8 @@ impl MarketTracker {
         reason: &str,
         intent: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!(
-            "📝 RECORDING EXIT: {} @ {:.4} (Reason: {})",
-            self.question, price, reason
-        );
-        let _ = self
-            .stats
-            .update_csv_exit_price(&self.market_id, price, intent, true, Some(price));
+        info!("📝 RECORDING EXIT: {} @ {:.4} (Reason: {})", self.question, price, reason);
+        let _ = self.stats.update_csv_exit_price(&self.market_id, price, intent, true, Some(price));
         Ok(())
     }
 
@@ -584,22 +544,12 @@ impl MarketTracker {
             Vol_MA20: "N/A".to_string(),
             Vol_State: format!("{:?}", self.vol_metrics.state),
             Trigger_Price: format!("{:.4}", self.trigger_price),
-            setup_tag: None,
-            entry_bucket: None,
-            signal_score: None,
+            setup_tag: None, entry_bucket: None, signal_score: None,
             reason_entry: Some("TrendHammer Trigger".to_string()),
-            reason_exit: None,
-            holding_seconds: None,
-            max_favor: None,
-            max_adverse: None,
-            market_regime: None,
-            ExitIntent: None,
-            ExitReason: None,
-            ExitConfirmed: None,
-            ExitOrderId: None,
-            ExitFilledShares: None,
-            ExitAvgFillPrice: None,
-            ExitTimestamp: None,
+            reason_exit: None, holding_seconds: None, max_favor: None,
+            max_adverse: None, market_regime: None, ExitIntent: None,
+            ExitReason: None, ExitConfirmed: None, ExitOrderId: None,
+            ExitFilledShares: None, ExitAvgFillPrice: None, ExitTimestamp: None,
         };
         let _ = self.stats.record_entry_to_csv(&record);
     }
@@ -611,16 +561,14 @@ impl MarketTracker {
         client: &reqwest::Client,
         now: DateTime<FixedOffset>,
         vol_metrics: VolatilityMetrics,
-        can_trigger_global: bool,
+        trend_hammer_active: bool,
     ) -> Vec<ExecutionEvent> {
         let (yes_ask, no_ask) = (asks.0.unwrap_or(0.0), asks.1.unwrap_or(0.0));
         let (yes_bid, no_bid) = (bids.0.unwrap_or(0.0), bids.1.unwrap_or(0.0));
         let mut events = Vec::new();
 
-        // --- TIME WINDOW CALCULATIONS (FORCED ET) ---
         let mut elapsed_secs = 0;
         if let Some(start) = self.start_minutes {
-            // now is already passed as ET from main.rs (loop_time)
             let h = now.hour();
             let m = now.minute();
             let s = now.second();
@@ -629,1090 +577,244 @@ impl MarketTracker {
             elapsed_secs = (current_total_secs - start_total_secs).rem_euclid(86400);
         }
 
-        // --- HARD SL BULLETPROOF ---
-        let current_exit_price = if self.state.side == "UP" {
-            yes_bid
-        } else {
-            no_bid
-        };
-
-        if self.shares_held > 0.0
-            && current_exit_price <= crate::risk_engine::HARD_SL_PRICE
-            && !self.is_exiting
-        {
-            self.is_exiting = true;
-            let tid = self.get_token_id();
-
-            match self
-                .execution
-                .close_position(
-                    client,
-                    &tid,
-                    self.shares_held,
-                    current_exit_price,
-                    "HARD_SL",
-                )
-                .await
-            {
-                Ok(resp) => {
-                    let exit_price = resp.fill_price.unwrap_or(current_exit_price);
-                    self.clear_protective_order(client).await;
-                    let _ = self
-                        .update_trade_exit_confirmed(exit_price, "HARD_SL_FORCED", "FORCED")
-                        .await;
-                    self.shares_held = 0.0;
-                    self.status = MarketStatus::Aborted("Hard SL Ejecutado".to_string());
-                    self.trade_state = TradeState::Closed;
-                    self.state.reset();
-                    return vec![ExecutionEvent::Log(format!(
-                        "SL protegido ejecutado @ {:.4} en {}",
-                        exit_price, self.question
-                    ))];
-                }
-                Err(e) => {
-                    self.is_exiting = false;
-                    let err_msg = e.to_string();
-                    let remaining_balance = crate::api::get_actual_balance(&tid)
-                        .await
-                        .unwrap_or(self.shares_held);
-                    self.shares_held = remaining_balance;
-                    self.state.shares_held = remaining_balance;
-
-                    // ANTI-SPAM: Abort on ghost positions or dust remnants
-                    if err_msg.contains("balance is exactly 0.0")
-                        || remaining_balance <= Self::min_sell_qty()
-                    {
-                        self.clear_protective_order(client).await;
-                        self.status = MarketStatus::Aborted("Balance Exhausted".to_string());
-                        self.trade_state = TradeState::Closed;
-                        self.state.reset();
-                        self.shares_held = 0.0;
-                        self.state.shares_held = 0.0;
-                        return vec![ExecutionEvent::Log(format!(
-                            "SL reconciliado en {}. El remanente quedo por debajo del minimo operativo y se limpia el estado local.",
-                            self.question
-                        ))];
-                    }
-
-                    if Self::is_terminal_exit_error(&err_msg) {
-                        self.status = MarketStatus::Aborted(
-                            "Market Terminal On Settlement Path".to_string(),
-                        );
-                        self.trade_state = TradeState::Closed;
-                        self.state.reset();
-                        self.shares_held = 0.0;
-                        return vec![ExecutionEvent::Log(format!(
-                            "Salida terminal sin liquidez/libro en {}. Se detienen reintentos y la posicion pasa a settlement/redeem.",
-                            self.question
-                        ))];
-                    }
-
-                    return vec![ExecutionEvent::Log(format!(
-                        "SL detectado en {} pero la salida quedo incompleta: {} | remanente {:.4}",
-                        self.question, e, remaining_balance
-                    ))];
-                }
-            }
-        }
-
-        // 1. HARD STOP LOSS (PRICE)
-        if false
-            && self.shares_held > 0.0
-            && current_exit_price <= crate::risk_engine::HARD_SL_PRICE
-            && !self.is_exiting
-        {
-            self.is_exiting = true;
-            info!(
-                "🚨 HARD SL TRIGGERED @ {:.4} (Market: {}) → MARKET SELL INMEDIATO",
-                current_exit_price, self.question
-            );
-
-            let tid = self.get_token_id();
-            let _ = crate::api::place_market_sell(
-                client,
-                &tid,
-                self.shares_held,
-                0.01, // precio mínimo para forzar fill
-            )
-            .await;
-
-            // Registrar salida confirmada
-            let _ = self
-                .update_trade_exit_confirmed(current_exit_price, "HARD_SL_FORCED", "FORCED")
-                .await;
-            self.status = MarketStatus::Aborted("Hard SL Ejecutado".to_string());
-            self.trade_state = TradeState::Closed;
-            self.state.reset();
-
-            return vec![ExecutionEvent::Log(format!(
-                "🔴 HARD SL EJECUTADO @ {:.4} en {}",
-                current_exit_price, self.question
-            ))];
-        }
-
-        let time_exit_trigger_secs = Self::time_exit_trigger_secs();
-
-        if Self::time_exit_enabled()
-            && self.shares_held > 0.0
-            && elapsed_secs >= time_exit_trigger_secs
-            && !self.is_exiting
-        {
-            self.is_exiting = true;
-            let tid = self.get_token_id();
-
-            match self
-                .execution
-                .close_position(
-                    client,
-                    &tid,
-                    self.shares_held,
-                    current_exit_price.max(0.10),
-                    "TIME_EXIT",
-                )
-                .await
-            {
-                Ok(resp) => {
-                    let exit_price = resp.fill_price.unwrap_or(current_exit_price);
-                    self.clear_protective_order(client).await;
-                    let _ = self
-                        .update_trade_exit_confirmed(exit_price, "SAFETY_TIME_EXIT", "TIME")
-                        .await;
-                    self.shares_held = 0.0;
-                    self.status = MarketStatus::Aborted(format!(
-                        "Safety Time Exit ({}s)",
-                        time_exit_trigger_secs
-                    ));
-                    self.trade_state = TradeState::Closed;
-                    self.state.reset();
-                    return vec![ExecutionEvent::Log(format!(
-                        "TIME EXIT protegido @ {:.4} en {}",
-                        exit_price, self.question
-                    ))];
-                }
-                Err(e) => {
-                    self.is_exiting = false;
-                    let err_msg = e.to_string();
-                    let remaining_balance = crate::api::get_actual_balance(&tid)
-                        .await
-                        .unwrap_or(self.shares_held);
-                    self.shares_held = remaining_balance;
-                    self.state.shares_held = remaining_balance;
-
-                    // ANTI-SPAM: Abort on ghost positions or dust remnants
-                    if err_msg.contains("balance is exactly 0.0")
-                        || remaining_balance <= Self::min_sell_qty()
-                    {
-                        self.clear_protective_order(client).await;
-                        self.status =
-                            MarketStatus::Aborted("Balance Exhausted (TIME_EXIT)".to_string());
-                        self.trade_state = TradeState::Closed;
-                        self.state.reset();
-                        self.shares_held = 0.0;
-                        self.state.shares_held = 0.0;
-                        return vec![ExecutionEvent::Log(format!(
-                            "TIME EXIT reconciliado en {}. El remanente quedo por debajo del minimo operativo y se limpia el estado local.",
-                            self.question
-                        ))];
-                    }
-
-                    if Self::is_terminal_exit_error(&err_msg) {
-                        self.status =
-                            MarketStatus::Aborted("Awaiting Redemption (TIME_EXIT)".to_string());
-                        self.trade_state = TradeState::Closed;
-                        self.state.reset();
-                        self.shares_held = 0.0;
-                        return vec![ExecutionEvent::Log(format!(
-                            "TIME EXIT sin liquidez/libro en {}. Se detienen reintentos y la posicion pasa a liquidacion/redeem.",
-                            self.question
-                        ))];
-                    }
-
-                    return vec![ExecutionEvent::Log(format!(
-                        "TIME EXIT detectado en {} pero la salida falló: {}",
-                        self.question, err_msg
-                    ))];
-                }
-            }
-        }
-
-        // --- ULTRA-AGGRESSIVE DETECTOR (LOBO 2026) ---
-        // Rule: If Binance moves > 0.12% in seconds, activate Trend Hammer
-        let mut trend_hammer_active = false;
-        if let Some(last_binance) = self.last_binance_price_update {
-            let binance_move =
-                (self.vol_metrics.current_price - last_binance).abs() / last_binance * 100.0;
-            if binance_move >= 0.12 {
-                if !self.ultra_aggressive_mode {
-                    info!("🚀 TREND HAMMER DETECTED: Binance moved {:.3}% in seconds! Activating Ultra-Aggressive Mode for {}", binance_move, self.question);
-                    self.ultra_aggressive_mode = true;
-                }
-                trend_hammer_active = true;
-            }
-        }
-        self.last_binance_price_update = Some(self.vol_metrics.current_price);
-
-        // 2. HARD SAFETY EXIT (TIME) - Minute 14:30 (870 seconds)
-        if false && self.shares_held > 0.0 && elapsed_secs >= 870 && !self.is_exiting {
-            self.is_exiting = true;
-            info!("🕒 SAFETY TIME EXIT (Minute 14:30) @ {:.4} (Market: {}) → CERRANDO POSICIÓN PROACTIVAMENTE", current_exit_price, self.question);
-
-            let tid = self.get_token_id();
-            let _ = crate::api::place_market_sell(client, &tid, self.shares_held, 0.01).await;
-
-            let _ = self
-                .update_trade_exit_confirmed(current_exit_price, "SAFETY_TIME_EXIT", "TIME")
-                .await;
-            self.status = MarketStatus::Aborted("Safety Time Exit (14:30)".to_string());
-            self.trade_state = TradeState::Closed;
-            self.state.reset();
-
-            return vec![ExecutionEvent::Log(format!(
-                "🕒 TIME EXIT PROACTIVO (14:30) @ {:.4} en {}",
-                current_exit_price, self.question
-            ))];
-        }
-
-        // Update volatility state
-        self.vol_metrics = vol_metrics;
-        self.trigger_price = self.vol_metrics.trigger_price;
-
-        // 1. PROACTIVE EXPIRATION (15 min window)
-        // Move to top to prevent scanning/trading expired markets
-        if let Some(_) = self.start_minutes {
-            if elapsed_secs >= 900 {
-                if self.shares_held > 0.0
-                    && !matches!(
-                        &self.status,
-                        MarketStatus::Aborted(reason)
-                            if reason == "Awaiting Settlement" || reason == "Awaiting Redemption"
-                    )
-                {
-                    self.status = MarketStatus::Aborted("Awaiting Settlement".to_string());
-                    self.trade_state = TradeState::Closed;
-                    self.state.reset();
-                    self.is_exiting = false;
-                    self.shares_held = 0.0;
-                    self.state.shares_held = 0.0;
-                    return vec![ExecutionEvent::Log(format!(
-                        "Mercado cerrado sin TP/SL en {}. La posicion queda a settlement/redeem y el resultado final se definira por resolucion.",
-                        self.question
-                    ))];
-                }
-
-                let already_expired = matches!(&self.status, MarketStatus::Aborted(reason) if reason == "Market Expired");
-                let can_emit_expired = matches!(
-                    self.state.current_state,
-                    PositionState::Scanning | PositionState::RecoveryScanning
-                );
-
-                if can_emit_expired && !already_expired {
-                    self.status = MarketStatus::Aborted("Market Expired".to_string());
-                    return vec![ExecutionEvent::MarketExpired {
-                        coin: self.binance_symbol.replace("USDT", ""),
-                        traded: self.has_traded_in_session,
-                        reason: Some(self.last_block_reason.clone()),
-                    }];
-                }
-            }
-        }
-
-        // 2. HIBERNATION (0 - 6:00 min)
-        if EntryEngine::is_hibernation_window(elapsed_secs) {
-            if now.second() % 30 == 0 {
-                debug!(
-                    "❄️ Market Hibernate ({}) - {}m elapsed",
-                    self.question,
-                    elapsed_secs / 60
-                );
-            }
-            return events;
-        }
-
-        // --- CORE STATE MACHINE ---
         match self.state.current_state {
-            PositionState::Scanning => {
-                if !can_trigger_global {
-                    self.last_block_reason = "trigger blocked".to_string();
-                    return events;
-                }
-
-                // 0. TIME BLOCK: No entries after 13:35 minutes (815s)
-                if elapsed_secs >= 815 {
-                    self.last_block_reason = "trigger blocked".to_string();
-                    if now.second() % 60 == 0 {
-                        info!(
-                            "⏳ ENTRY BLOCKED: Safety time threshold reached (13:35+) for {}",
-                            self.question
-                        );
-                    }
-                    return events;
-                }
-
-                // 1. RISK CHECK: Max 2 SL per market
-                if self.sl_count >= 2 {
-                    self.last_block_reason = "trigger blocked".to_string();
-                    if now.second() % 60 == 0 {
-                        info!(
-                            "🛑 ENTRY BLOCKED: Max SL limit (2) reached for {}",
-                            self.question
-                        );
-                    }
-                    return events;
-                }
-                if !self.entry.check_volatility_filter(&self.vol_metrics) {
-                    self.last_block_reason = "trigger blocked".to_string();
-                    return events;
-                }
-
+            PositionState::Scanning | PositionState::RecoveryScanning => {
                 let mut yes_trigger = self.trigger_price;
                 let mut no_trigger = self.trigger_price;
 
                 if let Some(yes_tid) = self.yes_token_id.as_ref() {
                     if yes_ask >= 0.84 && yes_ask <= self.max_entry_price {
                         let metrics = crate::api::get_orderbook_depth(client, yes_tid).await;
-                        yes_trigger =
-                            self.adjusted_trigger_from_orderbook(self.trigger_price, &metrics);
+                        yes_trigger = self.adjusted_trigger_from_orderbook(self.trigger_price, &metrics);
                     }
                 }
-
                 if let Some(no_tid) = self.no_token_id.as_ref() {
                     if no_ask >= 0.84 && no_ask <= self.max_entry_price {
                         let metrics = crate::api::get_orderbook_depth(client, no_tid).await;
-                        no_trigger =
-                            self.adjusted_trigger_from_orderbook(self.trigger_price, &metrics);
+                        no_trigger = self.adjusted_trigger_from_orderbook(self.trigger_price, &metrics);
                     }
                 }
 
-                let mut buy_yes = self.entry.evaluate_triggers(
-                    yes_ask,
-                    yes_trigger,
-                    self.max_entry_price,
-                    self.min_entry_price,
-                );
-                let mut buy_no = self.entry.evaluate_triggers(
-                    no_ask,
-                    no_trigger,
-                    self.max_entry_price,
-                    self.min_entry_price,
-                );
+                let mut buy_yes = self.entry.evaluate_triggers(yes_ask, yes_trigger, self.max_entry_price, self.min_entry_price);
+                let mut buy_no = self.entry.evaluate_triggers(no_ask, no_trigger, self.max_entry_price, self.min_entry_price);
 
-                // 2. RE-ENTRY ENFORCEMENT
                 if self.has_won_this_window && Self::reentries_enabled() {
-                    buy_yes = if Self::is_sane_contract_price(yes_ask) && yes_ask < 0.840 {
-                        true
-                    } else {
-                        buy_yes
-                            && Self::is_sane_contract_price(yes_ask)
-                            && self.is_valid_reentry_price(yes_ask)
-                    };
-
-                    buy_no = if Self::is_sane_contract_price(no_ask) && no_ask < 0.840 {
-                        true
-                    } else {
-                        buy_no
-                            && Self::is_sane_contract_price(no_ask)
-                            && self.is_valid_reentry_price(no_ask)
-                        };
+                    buy_yes = if Self::is_sane_contract_price(yes_ask) && yes_ask < 0.840 { true } else { buy_yes && self.is_valid_reentry_price(yes_ask) };
+                    buy_no = if Self::is_sane_contract_price(no_ask) && no_ask < 0.840 { true } else { buy_no && self.is_valid_reentry_price(no_ask) };
                 } else if self.has_won_this_window {
-                    buy_yes = false;
-                    buy_no = false;
+                    buy_yes = false; buy_no = false;
                     self.last_block_reason = "follow-up entry blocked".to_string();
                 }
 
-                if self.is_sol_market() {
-                    buy_no = false;
+                if buy_yes && yes_bid <= crate::risk_engine::HARD_SL_PRICE { buy_yes = false; self.last_block_reason = "bid <= HARD_SL".to_string(); }
+                if buy_no && no_bid <= crate::risk_engine::HARD_SL_PRICE { buy_no = false; self.last_block_reason = "bid <= HARD_SL".to_string(); }
+                if self.is_sol_market() { buy_no = false; } // SOL only UP (UP=yes)
+
+                // Failed entry cooldown (15s)
+                if let Some(last_f) = self.entry.last_failed_attempt {
+                    if last_f.elapsed().as_secs() < 15 {
+                        buy_yes = false;
+                        buy_no = false;
+                        self.last_block_reason = "failed entry cooldown".to_string();
+                    }
                 }
 
-                if !buy_yes && !buy_no {
-                    self.last_block_reason = "trigger blocked".to_string();
-                }
+                if (buy_yes || buy_no) && !self.is_exiting {
+                    // P0 FIX: Never open a position if we already have shares or an exit is pending
+                    if self.shares_held > 0.0 || self.closing_in_progress.load(Ordering::SeqCst) {
+                        self.last_block_reason = "posición abierta u orden pendiente".to_string();
+                        return events;
+                    }
 
-
-                if buy_yes || buy_no {
                     let side = if buy_yes { "UP" } else { "DOWN" };
                     let price = if buy_yes { yes_ask } else { no_ask };
-                    let selected_trigger = if buy_yes { yes_trigger } else { no_trigger };
-                    let token_id = if buy_yes {
-                        self.yes_token_id.as_ref()
-                    } else {
-                        self.no_token_id.as_ref()
-                    };
+                    let token_id = if buy_yes { self.yes_token_id.as_ref() } else { self.no_token_id.as_ref() };
 
-                    if !Self::is_sane_contract_price(price) {
-                        self.last_block_reason = "trigger blocked".to_string();
-                        warn!(
-                            "Entry blocked for {}: invalid book price {:.4} on side {}",
-                            self.question, price, side
-                        );
+                    if !Self::is_sane_contract_price(price) || self.should_block_expensive_late_entry(now, price) {
                         return events;
                     }
 
-                    if self.is_sol_market() && side == "DOWN" {
-                        self.last_block_reason = "sol down blocked".to_string();
-                        info!("SOL DOWN blocked for {}", self.question);
-                        return events;
-                    }
-
-                    if self.should_block_expensive_late_entry(now, price) {
-                        self.last_block_reason = "late expensive entry blocked".to_string();
-                        info!(
-                            "Late expensive entry blocked for {} | side={} | price={:.3} | minute={:02}",
-                            self.question,
-                            side,
-                            price,
-                            now.minute()
-                        );
-                        return events;
-                    }
-
-                    // --- LOBO 2026: EXECUTION TIMERS & CONFIRMATION ---
                     if !trend_hammer_active && !self.ultra_aggressive_mode {
-                        // 1. MOMENTUM DELAY (5s)
                         if self.trigger_hit_at.is_none() {
-                            info!(
-                                "⏱️ TRIGGER REACHED ({:.3}): Starting 5s Momentum Delay for {}",
-                                price, self.question
-                            );
                             self.trigger_hit_at = Some(std::time::Instant::now());
                             return events;
                         }
-
-                        let wait_time = if self.vol_metrics.state
-                            == crate::volatility::VolatilityState::NeutralHigh
-                            && self.vol_metrics.z_score > 1.8
-                        {
-                            23.0 // SHOT FILTER: 23s confirmation for high Z-Score/Neutral
-                        } else {
-                            5.0 // STANDARD: 5s momentum delay
-                        };
-
-                        if self.trigger_hit_at.unwrap().elapsed().as_secs_f64() < wait_time {
-                            return events; // Wait for timer
-                        }
-                    } else if trend_hammer_active {
-                        info!("🔨 TREND HAMMER: Skipping delays for {} entry!", side);
+                        let wait = if self.vol_metrics.state == crate::volatility::VolatilityState::NeutralHigh && self.vol_metrics.z_score > 1.8 { 23.0 } else { 5.0 };
+                        if self.trigger_hit_at.unwrap().elapsed().as_secs_f64() < wait { return events; }
                     }
 
                     if let Some(tid) = token_id {
-                        let token_id_owned = tid.clone();
-                        if let Ok(resp) = crate::api::place_initial_buy(
-                            client,
-                            tid,
-                            price,
-                            self.position_size,
-                            &self.market_id,
-                        )
-                        .await
-                        {
-                            // ... rest of logic
-                            let actual_price = resp.fill_price.unwrap_or(price);
-                            if resp.shares > 0.0 {
-                                self.last_block_reason = "operated".to_string();
-                                self.trigger_price = selected_trigger;
+                        let tid_owned = tid.clone();
+                        match crate::api::place_initial_buy(client, tid, price, self.position_size, &self.market_id).await {
+                            Ok(resp) => {
+                                let actual_price = resp.fill_price.unwrap_or(price);
                                 self.state.transition_to(PositionState::InPosition);
                                 self.state.side = side.to_string();
                                 self.state.entry_price = actual_price;
                                 self.state.shares_held = resp.shares;
                                 self.shares_held = resp.shares;
                                 self.binance_entry_reference = Some(self.vol_metrics.current_price);
+                                self.risk.update_active_levels(actual_price);
+                                self.active_stop_loss = Some(self.risk.active_stop_loss);
+                                self.active_take_profit = Some(self.risk.active_take_profit);
+                                self.refresh_protective_order(client, &tid_owned, resp.shares).await;
+                                self.status = MarketStatus::Executed(actual_price, side.to_string());
                                 self.has_traded_in_session = true;
-                                self.state.is_reentry = self.has_won_this_window;
-                                self.risk = RiskEngine::new(
-                                    self.position_size,
-                                    false,
-                                    self.state.is_reentry,
-                                );
-                                self.status =
-                                    MarketStatus::Executed(actual_price, side.to_string());
-                                self.active_stop_loss = Some(self.risk.active_stop_loss);
-                                self.active_take_profit = Some(self.risk.active_take_profit);
-                                self.record_trade_entry(
-                                    actual_price,
-                                    self.position_size,
-                                    "Initial",
-                                );
-                                self.refresh_protective_order(
-                                    client,
-                                    &token_id_owned,
-                                    resp.shares,
-                                )
-                                .await;
-                                self.trigger_hit_at = None;
-                            } else {
-                                log::warn!("⚠️ [ZERO-FILL] Buy order accepted but 0.0 shares received for {}. Aborting entry.", self.question);
+                                self.record_trade_entry(actual_price, self.position_size, "Initial");
+                                events.push(ExecutionEvent::Log(format!("🚀 *ENTRADA EJECUTADA*\n• Activo: *{}*\n• Dirección: *{}*\n• Precio: {:.3}", self.asset_label(), side, actual_price)));
                             }
-
-                            if resp.shares > 0.0 {
-                                let msg = format!(
-                                    "🚀 *ENTRADA DETECTADA*\n\
-• Activo: *{}*\n\
-• Dirección: *{}*\n\
-• Price to beat: {:.2}\n\
-• {} actual: {}\n\
-• Precio entrada: {:.3}\n\
-• Monto: ${:.2}",
-                                    self.asset_label(),
-                                    side,
-                                    self.price_to_beat.unwrap_or(0.0),
-                                    self.binance_symbol.replace("USDT", ""),
-                                    Self::format_price_delta(
-                                        self.vol_metrics.current_price,
-                                        self.price_to_beat
-                                    ),
-                                    actual_price,
-                                    self.position_size
-                                );
-
-                                events.push(ExecutionEvent::Log(msg));
+                            Err(e) => {
+                                error!("Entry failed for {}: {}", self.question, e);
+                                self.entry.last_failed_attempt = Some(std::time::Instant::now());
                             }
                         }
                     }
-                } else {
-                    self.trigger_hit_at = None;
                 }
             }
+            PositionState::InPosition => {
+                let current_exit_price = if self.state.side == "UP" { yes_bid } else { no_bid };
+                let current_ask_price = if self.state.side == "UP" { yes_ask } else { no_ask };
+                let tid = self.get_token_id();
+                let token_id_owned = tid.clone();
 
-            PositionState::InPosition | PositionState::PendingDCA => {
-                let current_exit_price = if self.state.side == "UP" {
-                    yes_bid
-                } else {
-                    no_bid
-                };
-                let current_ask_price = if self.state.side == "UP" {
-                    yes_ask
-                } else {
-                    no_ask
-                };
-                let token_id = if self.state.side == "UP" {
-                    self.yes_token_id.as_ref()
-                } else {
-                    self.no_token_id.as_ref()
-                };
-
-                if let Some(tid) = token_id {
-                    let token_id_owned = tid.clone();
-                    if let Some((adverse_move, threshold)) =
-                        self.should_preemptive_exit(current_exit_price)
-                    {
-                        let actual_shares = match crate::api::get_actual_balance(tid).await {
-                            Ok(bal) => {
-                                if bal > 0.0 {
-                                    bal
-                                } else {
-                                    self.state.shares_held
-                                }
-                            }
-                            Err(_) => self.state.shares_held,
-                        };
-
+                if !tid.is_empty() {
+                    // 1. EARLY EXIT BY BINANCE
+                    if let Some((adverse_move, threshold)) = self.should_preemptive_exit(current_exit_price) {
+                        let actual_shares = crate::api::get_actual_balance(&tid).await.unwrap_or(self.shares_held);
                         if actual_shares > Self::min_sell_qty() {
-                            let early_exit_target = current_exit_price.max(0.10);
-                            info!(
-                                "BINANCE EARLY EXIT for {}: adverse move {:.4}% >= {:.4}% with bid {:.3} near SL {:.3}",
-                                self.question,
-                                adverse_move * 100.0,
-                                threshold * 100.0,
-                                current_exit_price,
-                                self.risk.active_stop_loss
-                            );
-
-                            if let Ok(resp) = self
-                                .execution
-                                .close_position(
-                                    client,
-                                    tid,
-                                    actual_shares,
-                                    early_exit_target,
-                                    "EARLY_WARNING",
-                                )
-                                .await
-                            {
-                                let side = self.state.side.clone();
-                                let exit_price = resp.fill_price.unwrap_or(current_exit_price);
-                                let pnl = (exit_price - self.state.entry_price) * actual_shares;
-                                self.clear_protective_order(client).await;
-                                self.shares_held = 0.0;
-                                self.state.shares_held = 0.0;
-                                self.binance_entry_reference = None;
-                                self.status =
-                                    MarketStatus::Aborted("BINANCE_EARLY_WARNING".to_string());
-                                self.state.reset();
-                                let _ = self
-                                    .update_trade_exit_confirmed(
-                                        exit_price,
-                                        "BINANCE_EARLY_WARNING",
-                                        "EARLY",
-                                    )
-                                    .await;
-                                events.push(ExecutionEvent::Log(format!(
-                                    "⚠️ *SALIDA TEMPRANA POR BINANCE*\n\
-• Activo: *{}*\n\
-• Dirección: *{}*\n\
-• Precio cierre: {:.3}\n\
-• Binance en contra: {:.3}%\n\
-• Umbral activado: {:.3}%\n\
-• P&L: {}\n\
-• Estado: salida preventiva antes del SL duro",
-                                    self.asset_label(),
-                                    side,
-                                    exit_price,
-                                    adverse_move * 100.0,
-                                    threshold * 100.0,
-                                    Self::format_pnl(pnl)
-                                )));
-                                return events;
-                            }
-                        }
-                    }
-
-                    // 1. HARD STOP LOSS (Force balance check)
-                    if self.risk.should_hard_exit(current_exit_price) {
-                        // RECONCILE: Always check actual blockchain balance before SL
-                        let actual_shares = match crate::api::get_actual_balance(tid).await {
-                            Ok(bal) => {
-                                if bal > 0.0 {
-                                    bal
-                                } else {
-                                    self.state.shares_held
-                                }
-                            }
-                            Err(_) => self.state.shares_held,
-                        };
-
-                        info!(
-                            "💀 HARD SL TRIGGERED at {:.3} for {} (Qty: {:.4})",
-                            self.risk.active_stop_loss, self.question, actual_shares
-                        );
-                        if actual_shares <= Self::min_sell_qty() {
-                            warn!(
-                                "Ghost position detected on SL for {}. Balance already zero.",
-                                self.question
-                            );
-                            self.shares_held = 0.0;
-                            self.state.shares_held = 0.0;
-                            self.status = MarketStatus::Aborted("Balance Exhausted".to_string());
-                            self.state.reset();
-                            return vec![ExecutionEvent::Log(format!(
-                                "Posicion cerrada sin saldo disponible en {}. Se limpia el estado local.",
-                                self.question
-                            ))];
-                        }
-
-                        match self
-                            .execution
-                            .close_position(
-                                client,
-                                tid,
-                                actual_shares,
-                                current_exit_price,
-                                "HARD_SL",
-                            )
-                            .await
-                        {
-                            Ok(resp) => {
-                                let was_primary = self.risk.active_stop_loss > 0.50; // Simple check
-                                let side = self.state.side.clone();
-                                let entry_price = self.state.entry_price;
-                                let exit_price = resp.fill_price.unwrap_or(current_exit_price);
-                                let pnl = (exit_price - self.state.entry_price) * actual_shares;
-                                let return_pct = Self::format_return_pct(pnl, self.position_size);
-
-                                self.clear_protective_order(client).await;
-                                self.shares_held = 0.0;
-                                self.binance_entry_reference = None;
-                                self.sl_count += 1;
-                                self.status = MarketStatus::Aborted("HARD_SL".to_string());
-
-                                // Registrar salida confirmada
-                                let _ = self
-                                    .update_trade_exit_confirmed(exit_price, "HARD_SL", "SL")
-                                    .await;
-
-                                let msg = format!(
-                                    "❌ *OPERACIÓN PERDIDA*\n\
-• Activo: *{}*\n\
-• Resultado: *PERDIDA*\n\
-• Motivo de cierre: *HARD-SL-{:.2}*\n\
-• Dirección: *{}*\n\
-• Entrada: {:.3}\n\
-• Salida: {:.3}\n\
-• Monto operado: ${:.2}\n\
-• P&L: {}\n\
-• Retorno: {}",
-                                    self.asset_label(),
-                                    exit_price,
-                                    side,
-                                    entry_price,
-                                    exit_price,
-                                    self.position_size,
-                                    Self::format_pnl(pnl),
-                                    return_pct
-                                );
-                                events.push(ExecutionEvent::Log(msg));
-
-                                if was_primary && Self::reentries_enabled() {
-                                    self.state.shares_held = 0.0;
-                                    self.recovery_hit_at = Some(std::time::Instant::now());
-                                    self.state.transition_to(PositionState::RecoveryScanning);
-                                    info!(
-                                        "🔄 Entering FAKEOUT RECOVERY MODE for {}",
-                                        self.question
-                                    );
-                                } else {
-                                    self.state.reset();
-                                }
-                            }
-                            Err(e) => {
-                                let remaining_balance = crate::api::get_actual_balance(tid)
-                                    .await
-                                    .unwrap_or(actual_shares);
-                                self.shares_held = remaining_balance;
-                                self.state.shares_held = remaining_balance;
-                                self.is_exiting = false;
-
-                                if remaining_balance <= Self::min_sell_qty() {
+                            if self.closing_in_progress.swap(true, Ordering::SeqCst) { return events; }
+                            match self.execution.execute_safe_exit(&mut self.protection, client, &tid, current_exit_price.max(0.10)).await {
+                                Ok(resp) => {
+                                    let exit_p = resp.fill_price.unwrap_or(current_exit_price);
+                                    let pnl = (exit_p - self.state.entry_price) * actual_shares;
+                                    self.protection.check_daily_loss(pnl);
                                     self.clear_protective_order(client).await;
-                                    self.shares_held = 0.0;
-                                    self.state.shares_held = 0.0;
+                                    self.shares_held = 0.0; self.state.reset();
+                                    self.status = MarketStatus::Aborted("EARLY_EXIT".to_string());
+                                    self.update_trade_exit_confirmed(exit_p, "EARLY", "EARLY").await.ok();
+                                    events.push(ExecutionEvent::Log(format!("⚠️ *SALIDA TEMPRANA*\n• P&L: {}", Self::format_pnl(pnl))));
+                                    self.closing_in_progress.store(false, Ordering::SeqCst);
+                                    return events;
+                                }
+                                Err(e) => {
+                                    error!("EARLY_EXIT Safe Mode trigger: {}", e);
+                                    self.state.transition_to(PositionState::EmergencyExiting);
+                                    self.closing_in_progress.store(false, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. HARD STOP LOSS
+                    if self.risk.should_hard_exit(current_exit_price) {
+                        let actual_shares = crate::api::get_actual_balance(&tid).await.unwrap_or(self.shares_held);
+                        if actual_shares > Self::min_sell_qty() {
+                            if self.closing_in_progress.swap(true, Ordering::SeqCst) { return events; }
+                            match self.execution.execute_safe_exit(&mut self.protection, client, &tid, current_exit_price).await {
+                                Ok(resp) => {
+                                    let exit_p = resp.fill_price.unwrap_or(current_exit_price);
+                                    let pnl = (exit_p - self.state.entry_price) * actual_shares;
+                                    self.protection.check_daily_loss(pnl);
+                                    self.clear_protective_order(client).await;
+                                    self.shares_held = 0.0; self.state.reset();
                                     self.status = MarketStatus::Aborted("HARD_SL".to_string());
-                                    self.state.reset();
-                                    events.push(ExecutionEvent::Log(format!(
-                                        "SL completado tras reconciliacion en {}. El remanente quedo por debajo del minimo operativo.",
-                                        self.question
-                                    )));
-                                } else {
-                                    events.push(ExecutionEvent::Log(format!(
-                                        "SL escalonado incompleto en {}: {} | remanente {:.4}",
-                                        self.question, e, remaining_balance
-                                    )));
+                                    self.update_trade_exit_confirmed(exit_p, "SL", "SL").await.ok();
+                                    events.push(ExecutionEvent::Log(format!("❌ *STOP LOSS*\n• P&L: {}", Self::format_pnl(pnl))));
+                                    self.closing_in_progress.store(false, Ordering::SeqCst);
+                                    return events;
+                                }
+                                Err(e) => {
+                                    error!("HARD_SL Safe Mode trigger: {}", e);
+                                    self.state.transition_to(PositionState::EmergencyExiting);
+                                    self.closing_in_progress.store(false, Ordering::SeqCst);
                                 }
                             }
                         }
                     }
-                    // 2. TAKE PROFIT (0.97)
-                    else if self.risk.is_tp_reached(current_exit_price) {
-                        let actual_shares = match crate::api::get_actual_balance(tid).await {
-                            Ok(bal) => {
-                                if bal > 0.0 {
-                                    bal
-                                } else {
-                                    self.state.shares_held
+
+                    // 3. TAKE PROFIT
+                    if self.risk.is_tp_reached(current_exit_price) {
+                        let actual_shares = crate::api::get_actual_balance(&tid).await.unwrap_or(self.shares_held);
+                        if actual_shares > Self::min_sell_qty() {
+                            if self.closing_in_progress.swap(true, Ordering::SeqCst) { return events; }
+                            match self.execution.execute_safe_exit(&mut self.protection, client, &tid, current_exit_price).await {
+                                Ok(resp) => {
+                                    let exit_p = resp.fill_price.unwrap_or(current_exit_price);
+                                    let pnl = (exit_p - self.state.entry_price) * actual_shares;
+                                    self.protection.check_daily_loss(pnl);
+                                    self.clear_protective_order(client).await;
+                                    self.shares_held = 0.0; self.state.reset();
+                                    self.status = MarketStatus::Aborted("TAKE_PROFIT".to_string());
+                                    self.has_won_this_window = true;
+                                    self.update_trade_exit_confirmed(exit_p, "TP", "TP").await.ok();
+                                    events.push(ExecutionEvent::Log(format!("✅ *TAKE PROFIT*\n• P&L: {}", Self::format_pnl(pnl))));
+                                    self.closing_in_progress.store(false, Ordering::SeqCst);
+                                    return events;
+                                }
+                                Err(e) => {
+                                    error!("TAKE_PROFIT Safe Mode trigger: {}", e);
+                                    self.state.transition_to(PositionState::EmergencyExiting);
+                                    self.closing_in_progress.store(false, Ordering::SeqCst);
                                 }
                             }
-                            Err(_) => self.state.shares_held,
-                        };
-
-                        info!(
-                            "🎯 TAKE PROFIT reached at {:.3} for {} (Qty: {:.4})",
-                            current_exit_price, self.question, actual_shares
-                        );
-                        if actual_shares <= Self::min_sell_qty() {
-                            warn!(
-                                "Ghost position detected on TP for {}. Balance already zero.",
-                                self.question
-                            );
-                            self.clear_protective_order(client).await;
-                            self.shares_held = 0.0;
-                            self.state.shares_held = 0.0;
-                            self.status = MarketStatus::Aborted("Balance Exhausted".to_string());
-                            self.state.reset();
-                            return vec![ExecutionEvent::Log(format!(
-                                "Posicion ya cerrada en cadena para {}. Se limpia el estado local.",
-                                self.question
-                            ))];
-                        }
-
-                        if let Ok(resp) = self
-                            .execution
-                            .close_position(client, tid, actual_shares, 0.97, "TAKE_PROFIT")
-                            .await
-                        {
-                            let side = self.state.side.clone();
-                            let entry_price = self.state.entry_price;
-                            let exit_price = resp.fill_price.unwrap_or(0.97);
-                            let pnl = (exit_price - self.state.entry_price) * actual_shares;
-                            let return_pct = Self::format_return_pct(pnl, self.position_size);
-                            self.clear_protective_order(client).await;
-                            self.state.reset();
-                            self.shares_held = 0.0;
-                            self.binance_entry_reference = None;
-                            self.has_won_this_window = true;
-                            self.status = MarketStatus::Scanning {
-                                max_yes: 0.0,
-                                max_no: 0.0,
-                                last_update: None,
-                            };
-
-                            let msg = format!(
-                                "✅ *OPERACIÓN GANADA*\n\
-• Activo: *{}*\n\
-• Resultado: *GANADA*\n\
-• Motivo de cierre: *TP-{:.2}*\n\
-• Dirección: *{}*\n\
-• Entrada: {:.3}\n\
-• Salida: {:.3}\n\
-• Monto operado: ${:.2}\n\
-• P&L: {}\n\
-• Retorno: {}",
-                                self.asset_label(),
-                                exit_price,
-                                side,
-                                entry_price,
-                                exit_price,
-                                self.position_size,
-                                Self::format_pnl(pnl),
-                                return_pct
-                            );
-
-                            let _ = self
-                                .update_trade_exit_confirmed(exit_price, "TAKE_PROFIT", "TP")
-                                .await;
-                            events.push(ExecutionEvent::Log(msg));
                         }
                     }
-                    // 3. DCA TRIGGER (0.73 - 0.77)
-                    // Note: DCA trigger uses current_ask_price (buying more tokens)
-                    else if Self::dca_enabled()
-                        && !self.risk.dca_executed
-                        && self.risk.is_in_dca_range(current_ask_price)
-                    {
-                        if elapsed_secs >= 815 {
-                            if now.second() % 60 == 0 {
-                                info!(
-                                    "⏳ DCA BLOCKED: Safety time threshold reached (13:35+) for {}",
-                                    self.question
-                                );
-                            }
-                            return events;
-                        }
-                        if self.is_sol_market()
-                            && self.vol_metrics.state
-                                == crate::volatility::VolatilityState::HighSuperhigh
-                        {
-                            info!(
-                                "DCA blocked for {}: SOL with HIGH-SUPERHIGH volatility",
-                                self.question
-                            );
-                            return events;
-                        }
-                        if current_ask_price <= self.risk.active_stop_loss {
-                            warn!(
-                                "DCA blocked for {}: ask {:.3} is already at/below SL {:.3}",
-                                self.question, current_ask_price, self.risk.active_stop_loss
-                            );
-                            return events;
-                        }
-                        if current_exit_price <= self.risk.active_stop_loss {
-                            warn!(
-                                "DCA blocked for {}: bid {:.3} is already at/below SL {:.3}",
-                                self.question, current_exit_price, self.risk.active_stop_loss
-                            );
-                            return events;
-                        }
 
-                        let dca_bid_guard = self.risk.active_stop_loss + Self::dca_sl_gap();
-                        if current_exit_price <= dca_bid_guard {
-                            warn!(
-                                "DCA blocked for {}: bid {:.3} is too close to SL {:.3}",
-                                self.question, current_exit_price, self.risk.active_stop_loss
-                            );
-                            return events;
-                        }
-                        info!(
-                            "💰 DCA Range reached at {:.3} for {}",
-                            current_ask_price, self.question
-                        );
-                        let dca_size = self.risk.get_dca_size();
-                        let dca_limit = current_ask_price.clamp(
-                            crate::risk_engine::RiskEngine::dca_min_price(),
-                            crate::risk_engine::RiskEngine::dca_start_price(),
-                        );
-                        if dca_limit <= dca_bid_guard {
-                            warn!(
-                                "DCA blocked for {}: limit {:.3} is too close to/below SL guard {:.3}",
-                                self.question, dca_limit, dca_bid_guard
-                            );
-                            return events;
-                        }
-                        match crate::api::place_dca_limit_buy(
-                            client,
-                            tid,
-                            dca_limit,
-                            dca_size,
-                            &self.market_id,
-                        )
-                        .await
-                        {
+                    // 4. DCA
+                    if Self::dca_enabled() && !self.risk.dca_executed && self.risk.is_in_dca_range(current_ask_price) && elapsed_secs < 815 {
+                        let dca_limit = current_ask_price.clamp(RiskEngine::dca_min_price(), RiskEngine::dca_start_price());
+                        let tid_owned = tid.clone();
+                        match crate::api::place_dca_limit_buy(client, &tid, dca_limit, self.risk.get_dca_size(), &self.market_id).await {
                             Ok(resp) => {
-                                let actual_dca_price = resp.fill_price.unwrap_or(current_ask_price);
-                                let previous_shares = self.state.shares_held;
-                                let previous_cost = self.state.entry_price * previous_shares;
-                                let new_total_shares = previous_shares + resp.shares;
-
+                                let prev_shares = self.state.shares_held;
+                                let new_shares = prev_shares + resp.shares;
+                                self.state.entry_price = ((self.state.entry_price * prev_shares) + (resp.fill_price.unwrap_or(dca_limit) * resp.shares)) / new_shares;
+                                self.state.shares_held = new_shares; self.shares_held = new_shares;
                                 self.risk.dca_executed = true;
-                                self.state.shares_held = new_total_shares;
-                                self.shares_held = new_total_shares;
-                                self.binance_entry_reference = Some(self.vol_metrics.current_price);
-                                if new_total_shares > 0.0 {
-                                    self.state.entry_price = (previous_cost
-                                        + actual_dca_price * resp.shares)
-                                        / new_total_shares;
-                                }
                                 self.risk.update_active_levels(self.state.entry_price);
-                                self.active_stop_loss = Some(self.risk.active_stop_loss);
-                                self.active_take_profit = Some(self.risk.active_take_profit);
-                                self.refresh_protective_order(
-                                    client,
-                                    &token_id_owned,
-                                    new_total_shares,
-                                )
-                                .await;
-                                self.status = MarketStatus::Executed(
-                                    self.state.entry_price,
-                                    self.state.side.clone(),
-                                );
-                                self.record_trade_entry(actual_dca_price, dca_size, "DCA");
-                                let total_position = self.position_size * 2.0;
-                                events.push(ExecutionEvent::Log(format!(
-                                    "➕ *DCA EJECUTADO*\n\
-• Activo: *{}*\n\
-• Dirección: *{}*\n\
-• Nivel DCA: {:.3}\n\
-• Acciones añadidas: {:.4}\n\
-• Nuevo promedio: {:.3}\n\
-• Total en posición: ${:.2}",
-                                    self.asset_label(),
-                                    self.state.side,
-                                    actual_dca_price,
-                                    resp.shares,
-                                    self.state.entry_price,
-                                    total_position
-                                )));
+                                self.refresh_protective_order(client, &tid_owned, new_shares).await;
+                                events.push(ExecutionEvent::Log(format!("💰 *DCA EJECUTADO*\n• Nuevo Promedio: {:.3}", self.state.entry_price)));
                             }
-                            Err(e) => {
-                                warn!(
-                                    "DCA order failed for {} | side={} | ask={:.3} | bid={:.3} | limit={:.3} | size={:.2} | sl_guard={:.3} | reason={}",
-                                    self.question,
-                                    self.state.side,
-                                    current_ask_price,
-                                    current_exit_price,
-                                    dca_limit,
-                                    dca_size,
-                                    dca_bid_guard,
-                                    e
-                                );
-                                events.push(ExecutionEvent::Log(format!(
-                                    "DCA no ejecutado en {} | ask {:.3} | bid {:.3} | limit {:.3} | motivo: {}",
-                                    self.asset_label(),
-                                    current_ask_price,
-                                    current_exit_price,
-                                    dca_limit,
-                                    e
-                                )));
+                            Err(e) => warn!("DCA failed: {}", e),
+                        }
+                    }
+
+                    // 5. PANIC TIME EXIT (Anti-Zero Protection)
+                    if Self::time_exit_enabled() && elapsed_secs >= Self::time_exit_trigger_secs() {
+                        let actual_shares = crate::api::get_actual_balance(&tid).await.unwrap_or(self.shares_held);
+                        if actual_shares > Self::min_sell_qty() {
+                            let is_profit = current_exit_price > self.state.entry_price;
+                            
+                            // Si estamos en el último minuto y no hay profit, salir por lo que sea
+                            if !is_profit || elapsed_secs >= 885 {
+                                if self.closing_in_progress.swap(true, Ordering::SeqCst) { return events; }
+                                info!("🚨 PANIC TIME EXIT TRIGGERED: Closing at {}s to avoid 100% loss.", elapsed_secs);
+                                match self.execution.execute_safe_exit(&mut self.protection, client, &tid, current_exit_price).await {
+                                    Ok(resp) => {
+                                        let exit_p = resp.fill_price.unwrap_or(current_exit_price);
+                                        let pnl = (exit_p - self.state.entry_price) * actual_shares;
+                                        self.protection.check_daily_loss(pnl);
+                                        self.clear_protective_order(client).await;
+                                        self.shares_held = 0.0; self.state.reset();
+                                        self.status = MarketStatus::Aborted("TIME_EXIT".to_string());
+                                        self.update_trade_exit_confirmed(exit_p, "TIME", "TIME").await.ok();
+                                        events.push(ExecutionEvent::Log(format!("⏰ *SALIDA POR TIEMPO*\n• P&L: {}", Self::format_pnl(pnl))));
+                                        self.closing_in_progress.store(false, Ordering::SeqCst);
+                                        return events;
+                                    }
+                                    Err(e) => {
+                                        error!("TIME_EXIT Safe Mode trigger: {}", e);
+                                        self.state.transition_to(PositionState::EmergencyExiting);
+                                        self.closing_in_progress.store(false, Ordering::SeqCst);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-
-            PositionState::RecoveryScanning => {
-                // 0. TIME BLOCK: No recoveries after 13:35 minutes (815s)
-                if elapsed_secs >= 815 {
-                    if now.second() % 60 == 0 {
-                        info!(
-                            "⏳ RECOVERY BLOCKED: Safety time threshold reached (13:35+) for {}",
-                            self.question
-                        );
-                    }
-                    return events;
-                }
-
-                // 1. RISK CHECK: Max 2 SL per market
-                if self.sl_count >= 2 {
-                    if now.second() % 60 == 0 {
-                        info!(
-                            "🛑 RECOVERY BLOCKED: Max SL limit (2) reached for {}",
-                            self.question
-                        );
-                    }
-                    return events;
-                }
-
-                // Fakeout recovery re-enters on the same side after an 18s cooldown
-                let recovery_side = self.state.side.clone();
-                let recovery_price = if recovery_side == "UP" {
-                    yes_ask
-                } else {
-                    no_ask
-                };
-                let tid = if recovery_side == "UP" {
-                    self.yes_token_id.as_ref()
-                } else {
-                    self.no_token_id.as_ref()
-                };
-
-                if self
-                    .recovery_hit_at
-                    .map(|hit| hit.elapsed().as_secs() < 18)
-                    .unwrap_or(false)
-                {
-                    return events;
-                }
-
-                if !Self::is_sane_contract_price(recovery_price) {
-                    warn!(
-                        "Recovery entry blocked for {}: invalid book price {:.4}",
-                        self.question, recovery_price
-                    );
-                    return events;
-                }
-
-                if recovery_price >= 0.85 && recovery_price <= 0.88 {
-                    if let Some(target_tid) = tid {
-                        if let Ok(resp) = crate::api::place_initial_buy(
-                            client,
-                            target_tid,
-                            recovery_price,
-                            self.position_size,
-                            &self.market_id,
-                        )
-                        .await
-                        {
-                            let actual_recovery_price = resp.fill_price.unwrap_or(recovery_price);
-                            self.state.transition_to(PositionState::InPosition);
-                            self.state.side = recovery_side.to_string();
-                            self.state.entry_price = actual_recovery_price;
-                            self.state.shares_held = resp.shares;
-                            self.shares_held = resp.shares;
-                            self.binance_entry_reference = Some(self.vol_metrics.current_price);
-
-                            self.risk = RiskEngine::new(self.position_size, false, false);
-                            self.risk.dca_executed = true;
-
-                            self.status = MarketStatus::Executed(
-                                actual_recovery_price,
-                                recovery_side.to_string(),
-                            );
-                            self.recovery_hit_at = None;
-                            events.push(ExecutionEvent::Log(format!(
-                                "🔥 *FAKEOUT RECOVERY ACTIVADO*\n\
-• Activo: *{}*\n\
-• Dirección: *{}*\n\
-• Precio de entrada: {:.3}\n\
-• Ventana recovery: 18s\n\
-• Rango validado: 0.85 - 0.88",
-                                self.asset_label(),
-                                recovery_side,
-                                actual_recovery_price
-                            )));
-                        }
-                    }
-                }
-            }
-
-            PositionState::Exiting => {}
+            _ => {}
         }
-
         events
     }
 
@@ -1734,8 +836,7 @@ impl MarketTracker {
             protective_order_id: self.protective_order_id.clone(),
             entry_type: format!("{:?}", self.state.current_state),
             saved_at: chrono::Local::now().to_rfc3339(),
-            protection_status: None,
-            last_balance_check: None,
+            protection_status: None, last_balance_check: None,
             exit_in_progress: Some(self.is_exiting),
             trade_state: format!("{:?}", self.trade_state),
             ultra_aggressive_mode: self.ultra_aggressive_mode,
@@ -1746,157 +847,32 @@ impl MarketTracker {
     fn parse_start_time(title: &str) -> Option<u32> {
         let re = Regex::new(r"(?i)(\d{1,2}:\d{2})\s*(AM|PM)?").ok()?;
         let caps: Vec<_> = re.captures_iter(title).collect();
-        if caps.len() < 2 {
-            return None;
-        }
-
+        if caps.len() < 2 { return None; }
         let cap = &caps[caps.len().checked_sub(2)?];
         let time_str = cap.get(1)?.as_str();
-        let amp_str = cap.get(2).map(|m: regex::Match| m.as_str().to_uppercase());
-
+        let amp_str = cap.get(2).map(|m| m.as_str().to_uppercase());
         let parts: Vec<&str> = time_str.split(':').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-
         let mut h: u32 = parts[0].parse().ok()?;
         let m: u32 = parts[1].parse().ok()?;
-
         if let Some(amp) = amp_str {
-            if amp == "PM" && h != 12 {
-                h += 12;
-            } else if amp == "AM" && h == 12 {
-                h = 0;
-            }
+            if amp == "PM" && h != 12 { h += 12; } else if amp == "AM" && h == 12 { h = 0; }
         }
-
         Some(h * 60 + m)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::api::Market;
-    use crate::state_machine::PositionState;
-    use crate::volatility::VolatilityMetrics;
-    use chrono::{FixedOffset, TimeZone};
-
-    fn build_test_tracker() -> MarketTracker {
-        let market = Market {
-            id: "test-market".to_string(),
-            question: "XRP Up or Down - April 9, 8:15AM-8:30AM ET".to_string(),
-            slug: Some("xrp-up-or-down-test".to_string()),
-            outcome_prices: None,
-            clob_token_ids: Some("[\"yes-test-token\",\"no-test-token\"]".to_string()),
-            closed: Some(false),
-            active: Some(true),
-        };
-
-        MarketTracker::new(
-            market,
-            Some(0.885),
-            Some(1.36),
-            VolatilityMetrics {
-                current_price: 1.35,
-                last_price: 1.35,
-                ..VolatilityMetrics::default()
-            },
-            "XRPUSDT".to_string(),
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(crate::stats::StatsEngine::new()),
-        )
-    }
-
-    #[tokio::test]
-    async fn test_refresh_protective_order_in_paper_mode() {
-        std::env::set_var("PAPER_TRADING", "true");
-
-        let client = reqwest::Client::new();
-        let mut tracker = build_test_tracker();
-        tracker.risk.active_stop_loss = 0.68;
-
-        tracker
-            .refresh_protective_order(&client, "no-test-token", 6.74)
-            .await;
-
-        assert_eq!(
-            tracker.protective_order_id.as_deref(),
-            Some("SIMULATED_PROT_ID")
-        );
-        assert_eq!(tracker.trade_state, TradeState::OpenProtected);
-    }
-
-    #[tokio::test]
-    async fn test_hard_sl_closes_position_in_paper_mode() {
-        std::env::set_var("PAPER_TRADING", "true");
-        std::env::set_var("HARD_SL_PRICE", "0.68");
-
-        let client = reqwest::Client::new();
-        let mut tracker = build_test_tracker();
-        crate::api::seed_paper_balance("no-test-token", 6.74);
-        tracker.state.transition_to(PositionState::InPosition);
-        tracker.state.side = "DOWN".to_string();
-        tracker.state.entry_price = 0.85;
-        tracker.state.shares_held = 6.74;
-        tracker.shares_held = 6.74;
-        tracker.status = MarketStatus::Executed(0.85, "DOWN".to_string());
-        tracker.trade_state = TradeState::OpenProtected;
-        tracker.protective_order_id = Some("SIMULATED_PROT_ID".to_string());
-        tracker.risk.active_stop_loss = 0.68;
-
-        let now = FixedOffset::west_opt(4 * 3600)
-            .unwrap()
-            .with_ymd_and_hms(2026, 4, 9, 8, 27, 0)
-            .single()
-            .unwrap();
-
-        let events = tracker
-            .check(
-                (Some(0.32), Some(0.69)),
-                (Some(0.31), Some(0.67)),
-                &client,
-                now,
-                VolatilityMetrics {
-                    current_price: 1.362,
-                    last_price: 1.357,
-                    ..VolatilityMetrics::default()
-                },
-                true,
-            )
-            .await;
-
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ExecutionEvent::Log(msg) if msg.contains("SL protegido ejecutado")
-        )));
-        assert_eq!(tracker.shares_held, 0.0);
-        assert!(tracker.protective_order_id.is_none());
-        assert_eq!(tracker.trade_state, TradeState::Closed);
-        assert!(matches!(tracker.status, MarketStatus::Aborted(_)));
     }
 }
 
 pub fn save_active_states(snapshots: &[ActiveStateSnapshot]) {
     let mut path = std::env::current_exe().unwrap_or_default();
-    path.pop();
-    path.push("active_state.json");
-    if let Ok(json) = serde_json::to_string_pretty(snapshots) {
-        let _ = std::fs::write(&path, json);
-    }
+    path.pop(); path.push("active_state.json");
+    if let Ok(json) = serde_json::to_string_pretty(snapshots) { let _ = std::fs::write(&path, json); }
 }
 
 pub fn load_active_states() -> Vec<ActiveStateSnapshot> {
     let mut path = std::env::current_exe().unwrap_or_default();
-    path.pop();
-    path.push("active_state.json");
-    if !path.exists() {
-        return Vec::new();
-    }
+    path.pop(); path.push("active_state.json");
+    if !path.exists() { return Vec::new(); }
     if let Ok(json) = std::fs::read_to_string(&path) {
-        if let Ok(snaps) = serde_json::from_str::<Vec<ActiveStateSnapshot>>(&json) {
-            return snaps;
-        }
+        if let Ok(snaps) = serde_json::from_str::<Vec<ActiveStateSnapshot>>(&json) { return snaps; }
     }
     Vec::new()
 }

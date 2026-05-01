@@ -8,6 +8,30 @@ autobins = false
 name = "arbitrage_hammer"
 path = "src/main.rs"
 
+[[bin]]
+name = "check_markets"
+path = "src/bin/check_markets.rs"
+
+[[bin]]
+name = "check_prices"
+path = "src/bin/check_prices.rs"
+
+[[bin]]
+name = "check_balances"
+path = "src/bin/check_balances.rs"
+
+[[bin]]
+name = "live_preflight"
+path = "src/bin/live_preflight.rs"
+
+[[bin]]
+name = "diagnose_entry"
+path = "src/bin/diagnose_entry.rs"
+
+[[bin]]
+name = "check_fills"
+path = "src/bin/check_fills.rs"
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.11", features = ["json", "blocking"] }

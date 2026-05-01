@@ -11,11 +11,16 @@ fn env_f64(name: &str, default: f64) -> f64 {
 fn env_bool(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
-fn distance_threshold_for(symbol: &str, state: VolatilityState) -> f64 {
+pub fn distance_threshold_for(symbol: &str, state: VolatilityState) -> f64 {
     let asset = if symbol.contains("BTC") {
         "BTC"
     } else if symbol.contains("ETH") {
@@ -29,28 +34,31 @@ fn distance_threshold_for(symbol: &str, state: VolatilityState) -> f64 {
     };
 
     let (suffix, fallback) = match (asset, state) {
-        ("BTC", VolatilityState::LowNeutral) => ("LOW_NEUTRAL", 60.0),
-        ("BTC", VolatilityState::NeutralHigh) => ("NEUTRAL_HIGH", 90.0),
-        ("BTC", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 140.0),
-        ("ETH", VolatilityState::LowNeutral) => ("LOW_NEUTRAL", 1.5),
-        ("ETH", VolatilityState::NeutralHigh) => ("NEUTRAL_HIGH", 2.5),
-        ("ETH", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 4.0),
-        ("SOL", VolatilityState::LowNeutral) => ("LOW_NEUTRAL", 0.10),
+        ("BTC", VolatilityState::LowNeutral) => ("LOW_NEUTRAL", 77.0),
+        ("BTC", VolatilityState::NeutralHigh) => ("NEUTRAL_HIGH", 77.0),
+        ("BTC", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 77.0),
+        ("ETH", VolatilityState::LowNeutral) => ("LOW_NEUTRAL", 2.23),
+        ("ETH", VolatilityState::NeutralHigh) => ("NEUTRAL_HIGH", 2.23),
+        ("ETH", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 2.23),
+        ("SOL", VolatilityState::LowNeutral) => ("LOW_NEUTRAL", 0.16),
         ("SOL", VolatilityState::NeutralHigh) => ("NEUTRAL_HIGH", 0.16),
-        ("SOL", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 0.24),
+        ("SOL", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 0.16),
         ("XRP", VolatilityState::LowNeutral) => ("LOW_NEUTRAL", 0.0018),
-        ("XRP", VolatilityState::NeutralHigh) => ("NEUTRAL_HIGH", 0.0026),
-        ("XRP", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 0.0036),
+        ("XRP", VolatilityState::NeutralHigh) => ("NEUTRAL_HIGH", 0.0018),
+        ("XRP", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 0.0018),
         ("GENERIC", VolatilityState::LowNeutral) => ("LOW_NEUTRAL", 0.00102),
         ("GENERIC", VolatilityState::NeutralHigh) => ("NEUTRAL_HIGH", 0.00146),
         ("GENERIC", VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 0.00195),
         _ => ("NEUTRAL_HIGH", 0.00146),
     };
 
-    env_f64(&format!("{}_DISTANCE_THRESHOLD_{}", asset, suffix), fallback)
+    env_f64(
+        &format!("{}_DISTANCE_THRESHOLD_{}", asset, suffix),
+        fallback,
+    )
 }
 
-fn distance_threshold_pct_for(symbol: &str, state: VolatilityState) -> f64 {
+pub fn distance_threshold_pct_for(symbol: &str, state: VolatilityState) -> f64 {
     let asset = if symbol.contains("BTC") {
         "BTC"
     } else if symbol.contains("ETH") {
@@ -72,7 +80,10 @@ fn distance_threshold_pct_for(symbol: &str, state: VolatilityState) -> f64 {
         (_, VolatilityState::HighSuperhigh) => ("HIGH_SUPERHIGH", 0.0),
     };
 
-    env_f64(&format!("{}_DISTANCE_THRESHOLD_PCT_{}", asset, suffix), fallback)
+    env_f64(
+        &format!("{}_DISTANCE_THRESHOLD_PCT_{}", asset, suffix),
+        fallback,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,8 +132,7 @@ impl EntryEngine {
             return false;
         }
 
-        if env_bool("BLOCK_HIGH_SUPERHIGH", true)
-            && metrics.state == VolatilityState::HighSuperhigh
+        if env_bool("BLOCK_HIGH_SUPERHIGH", true) && metrics.state == VolatilityState::HighSuperhigh
         {
             log::warn!(
                 "Blocked by volatility regime {:?}. now={:.4}% base200={:.4}% z={:.2}",
@@ -184,6 +194,27 @@ impl EntryEngine {
                 absolute_threshold,
                 pct_change * 100.0
             );
+
+            // ── CRITICAL: PTB ALIGNMENT CHECK ──────────────────────────────
+            // If BTC is BELOW the strike (PTB) and we want to buy UP = instant loss.
+            // If BTC is ABOVE the strike (PTB) and we want to buy DOWN = instant loss.
+            // This is the #1 cause of capital destruction.
+            let ptb_gap_pct = (current - base_price) / base_price;
+            if side == "UP" && current < base_price {
+                log::warn!(
+                    "PTB ALIGNMENT BLOCK: {} UP entry rejected. BTC {:.2} is BELOW strike {:.2} (gap={:.2}%). Would be an instant loser.",
+                    symbol, current, base_price, ptb_gap_pct * 100.0
+                );
+                return DistanceCheckResult::DirectionBlocked;
+            }
+            if side == "DOWN" && current > base_price {
+                log::warn!(
+                    "PTB ALIGNMENT BLOCK: {} DOWN entry rejected. BTC {:.2} is ABOVE strike {:.2} (gap={:.2}%). Would be an instant loser.",
+                    symbol, current, base_price, ptb_gap_pct * 100.0
+                );
+                return DistanceCheckResult::DirectionBlocked;
+            }
+            // ── END PTB ALIGNMENT CHECK ─────────────────────────────────────
 
             if side == "UP" && pct_change <= -divergence_threshold {
                 log::debug!(

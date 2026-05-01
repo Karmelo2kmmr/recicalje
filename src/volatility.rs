@@ -1,8 +1,60 @@
-use log::{info, warn};
+use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono_tz::America::New_York;
+use log::{error, info, warn};
 use reqwest::{Client, RequestBuilder, Response};
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::sleep;
+
+pub async fn fetch_binance_candle_open(
+    client: &Client,
+    symbol: &str,
+    start_mins: i32,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let now = Utc::now();
+    let et_now = now.with_timezone(&New_York);
+
+    // Calculate the target DateTime for the window start today
+    let target_et = New_York
+        .with_ymd_and_hms(
+            et_now.year(),
+            et_now.month(),
+            et_now.day(),
+            (start_mins / 60) as u32,
+            (start_mins % 60) as u32,
+            0,
+        )
+        .single()
+        .ok_or("Failed to calculate ET timestamp")?;
+
+    // If target is in the future, it might be from yesterday (e.g. market for early morning started late night)
+    // But for 15m crypto, usually it's current.
+    let target_utc = target_et.with_timezone(&Utc);
+    let timestamp = target_utc.timestamp_millis();
+
+    let url = "https://api.binance.com/api/v3/klines";
+    let params = [
+        ("symbol", symbol),
+        ("interval", "1m"),
+        ("startTime", &timestamp.to_string()),
+        ("limit", "1"),
+    ];
+
+    let builder = client.get(url).query(&params);
+    let resp = send_with_retry(builder).await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Binance API error: {}", resp.status()).into());
+    }
+
+    let klines: Vec<Kline> = resp.json().await?;
+    if let Some(k) = klines.first() {
+        let open_price = k.1.parse::<f64>()?;
+        return Ok(open_price);
+    }
+
+    Err("No klines found for the specified timestamp".into())
+}
 
 #[derive(Deserialize, Debug)]
 pub struct Kline(
@@ -101,7 +153,7 @@ impl Default for VolatilityMetrics {
 }
 
 pub async fn get_volatility_metrics(client: &Client, symbol: &str) -> VolatilityMetrics {
-    let url = "https://api.binance.us/api/v3/klines";
+    let url = "https://api.binance.com/api/v3/klines";
     let params = [("symbol", symbol), ("interval", "1m"), ("limit", "200")];
 
     let builder = client.get(url).query(&params);
@@ -232,12 +284,8 @@ fn calculate_trigger_from_vol(ratio: f64, z_score: f64) -> (f64, VolatilityState
     };
 
     let adjusted_trigger = match state {
-        VolatilityState::LowNeutral => {
-            base_trigger - env_f64("TRIGGER_OFFSET_LOW_NEUTRAL", 0.0055)
-        }
-        VolatilityState::NeutralHigh => {
-            base_trigger + env_f64("TRIGGER_OFFSET_NEUTRAL_HIGH", 0.0)
-        }
+        VolatilityState::LowNeutral => base_trigger - env_f64("TRIGGER_OFFSET_LOW_NEUTRAL", 0.0055),
+        VolatilityState::NeutralHigh => base_trigger + env_f64("TRIGGER_OFFSET_NEUTRAL_HIGH", 0.0),
         VolatilityState::HighSuperhigh => {
             base_trigger + env_f64("TRIGGER_OFFSET_HIGH_SUPERHIGH", 0.015)
         }

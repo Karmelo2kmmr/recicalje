@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Duration, Local, Utc};
-use log::{debug, error, info};
-use rsa::rand_core::OsRng;
+use log::{debug, error, info, warn};
 use reqwest::{header, Client, Method};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::pss::SigningKey;
+use rsa::rand_core::OsRng;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::RsaPrivateKey;
 use serde::Deserialize;
@@ -54,7 +54,6 @@ pub struct OrderExecution {
 }
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
 
 const KALSHI_API_URL: &str = "https://demo-api.kalshi.co/trade-api/v2";
 pub const KALSHI_PROD_URL: &str = "https://api.elections.kalshi.com/trade-api/v2";
@@ -183,10 +182,28 @@ struct GetOrderResponse {
 }
 
 #[derive(Deserialize, Debug)]
+struct GetPositionsResponse {
+    #[serde(default, alias = "market_positions")]
+    pub positions: Vec<KalshiPosition>,
+}
+
+#[derive(Deserialize, Debug)]
 struct GetFillsResponse {
     fills: Vec<HistoricalFill>,
     #[allow(dead_code)]
     cursor: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct KalshiPosition {
+    #[serde(default)]
+    pub ticker: String,
+    #[serde(default)]
+    pub position: i64,
+    #[serde(default)]
+    pub position_fp: String,
+    #[serde(default)]
+    pub market_ticker: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -231,8 +248,9 @@ pub struct KalshiOrder {
     pub status: String,
     pub fill_count_fp: String,
     pub remaining_count_fp: String,
+    pub taker_fill_cost_dollars: Option<String>,
+    pub maker_fill_cost_dollars: Option<String>,
 }
-
 
 pub struct KalshiClient {
     pub client: Client,
@@ -245,14 +263,33 @@ pub struct KalshiClient {
 }
 
 impl KalshiClient {
-    pub async fn buy_yes(&self, ticker: &str, size: f64, price: f64) -> Result<KalshiOrder, BoxError> {
-        info!("🛒 [KALSHI] Buying YES on {}: size={}, price={:.2}", ticker, size, price);
-        self.submit_order(ticker, "yes", "buy", price, size as u32, "fill_or_kill").await
+    pub async fn buy_yes(
+        &self,
+        ticker: &str,
+        size: f64,
+        price: f64,
+    ) -> Result<KalshiOrder, BoxError> {
+        info!("\u{1F6D2} [KALSHI] Buying YES on {}: size={}, price={:.2}", ticker, size, price);
+        // P0 FIX: size as u32 truncates — 7.9 becomes 7, leaving orphaned contracts.
+        let count = size.round() as u32;
+        if (size - size.round()).abs() > 0.1 {
+            warn!("Kalshi buy_yes rounding: {:.4} -> {} contracts", size, count);
+        }
+        self.submit_order(ticker, "yes", "buy", price, count, "immediate_or_cancel").await
     }
 
-    pub async fn buy_no(&self, ticker: &str, size: f64, price: f64) -> Result<KalshiOrder, BoxError> {
-        info!("🛒 [KALSHI] Buying NO on {}: size={}, price={:.2}", ticker, size, price);
-        self.submit_order(ticker, "no", "buy", price, size as u32, "fill_or_kill").await
+    pub async fn buy_no(
+        &self,
+        ticker: &str,
+        size: f64,
+        price: f64,
+    ) -> Result<KalshiOrder, BoxError> {
+        info!("\u{1F6D2} [KALSHI] Buying NO on {}: size={}, price={:.2}", ticker, size, price);
+        let count = size.round() as u32;
+        if (size - size.round()).abs() > 0.1 {
+            warn!("Kalshi buy_no rounding: {:.4} -> {} contracts", size, count);
+        }
+        self.submit_order(ticker, "no", "buy", price, count, "immediate_or_cancel").await
     }
 
     pub async fn sell_yes(
@@ -261,12 +298,12 @@ impl KalshiClient {
         size: f64,
         price: f64,
     ) -> Result<KalshiOrder, BoxError> {
-        info!(
-            "KALSHI SELL YES | ticker={} | size={} | price={:.2}",
-            ticker, size, price
-        );
-        self.submit_order(ticker, "yes", "sell", price, size as u32, "immediate_or_cancel")
-            .await
+        info!("KALSHI SELL YES | ticker={} | size={} | price={:.2}", ticker, size, price);
+        let count = size.round() as u32;
+        if (size - size.round()).abs() > 0.1 {
+            warn!("Kalshi sell_yes rounding: {:.4} -> {} contracts", size, count);
+        }
+        self.submit_order(ticker, "yes", "sell", price, count, "immediate_or_cancel").await
     }
 
     pub async fn sell_no(
@@ -275,12 +312,12 @@ impl KalshiClient {
         size: f64,
         price: f64,
     ) -> Result<KalshiOrder, BoxError> {
-        info!(
-            "KALSHI SELL NO | ticker={} | size={} | price={:.2}",
-            ticker, size, price
-        );
-        self.submit_order(ticker, "no", "sell", price, size as u32, "immediate_or_cancel")
-            .await
+        info!("KALSHI SELL NO | ticker={} | size={} | price={:.2}", ticker, size, price);
+        let count = size.round() as u32;
+        if (size - size.round()).abs() > 0.1 {
+            warn!("Kalshi sell_no rounding: {:.4} -> {} contracts", size, count);
+        }
+        self.submit_order(ticker, "no", "sell", price, count, "immediate_or_cancel").await
     }
 
     pub async fn init_prod() -> Result<Self, BoxError> {
@@ -306,11 +343,16 @@ impl KalshiClient {
     }
 
     fn with_mode(email: String, password: String, prod: bool) -> Self {
-        let access_key = std::env::var("KALSHI_ACCESS_KEY").ok().filter(|v| !v.is_empty());
+        let access_key = std::env::var("KALSHI_ACCESS_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
         let private_key = load_private_key_from_env();
 
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             email,
             password,
             bearer_token: None,
@@ -329,7 +371,9 @@ impl KalshiClient {
     }
 
     fn auth_header(&self) -> Option<String> {
-        self.bearer_token.as_ref().map(|token| format!("Bearer {}", token))
+        self.bearer_token
+            .as_ref()
+            .map(|token| format!("Bearer {}", token))
     }
 
     fn sign_headers(&self, method: &Method, path: &str) -> Option<header::HeaderMap> {
@@ -348,7 +392,10 @@ impl KalshiClient {
         let signature_b64 = general_purpose::STANDARD.encode(signature.to_vec());
 
         let mut headers = header::HeaderMap::new();
-        headers.insert("KALSHI-ACCESS-KEY", header::HeaderValue::from_str(access_key).ok()?);
+        headers.insert(
+            "KALSHI-ACCESS-KEY",
+            header::HeaderValue::from_str(access_key).ok()?,
+        );
         headers.insert(
             "KALSHI-ACCESS-TIMESTAMP",
             header::HeaderValue::from_str(&timestamp).ok()?,
@@ -397,7 +444,11 @@ impl KalshiClient {
             side: side.to_string(),
             action: action.to_string(),
             count,
-            yes_price_dollars: if side == "yes" { Some(price.clone()) } else { None },
+            yes_price_dollars: if side == "yes" {
+                Some(price.clone())
+            } else {
+                None
+            },
             no_price_dollars: if side == "no" { Some(price) } else { None },
             time_in_force: tif.to_string(),
         };
@@ -412,13 +463,41 @@ impl KalshiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            // P0 FIX: Detect token expiry explicitly. Silent 401s cause the bot to keep
+            // looping while zero orders reach the exchange.
+            if status.as_u16() == 401 {
+                error!(
+                    "KALSHI AUTH EXPIRED (401): Token is invalid or expired. All orders are failing silently. Restart required to re-authenticate. Body: {}",
+                    body
+                );
+                return Err(format!("Kalshi auth expired (401) — restart to re-login: {}", body).into());
+            }
             return Err(format!("Kalshi create order failed: {} {}", status, body).into());
         }
 
         let payload: CreateOrderResponse = response.json().await?;
         let filled = payload.order.fill_count_fp.parse::<f64>().unwrap_or(0.0);
-        let remaining = payload.order.remaining_count_fp.parse::<f64>().unwrap_or(0.0);
+        let remaining = payload
+            .order
+            .remaining_count_fp
+            .parse::<f64>()
+            .unwrap_or(0.0);
         let expected = count as f64;
+
+        // P0 FIX: IOC (immediate_or_cancel) orders with zero fills are silently returned as Ok.
+        // This is the #1 cause of phantom fills in Kalshi — the bot thinks it bought/sold
+        // but nothing actually executed. Treat zero-fill IOC as an error.
+        if tif == "immediate_or_cancel" && filled < 0.001 {
+            error!(
+                "KALSHI IOC ZERO-FILL: ticker={} side={} action={} status={} filled={} remaining={} — NO CONTRACTS EXECUTED",
+                ticker, side, action, payload.order.status, filled, remaining
+            );
+            return Err(format!(
+                "Kalshi IOC zero-fill: ticker={} side={} action={} status={} — zero contracts filled. Check liquidity.",
+                ticker, side, action, payload.order.status
+            ).into());
+        }
+
         if tif == "fill_or_kill" && (filled + 0.0001 < expected || remaining > 0.0001) {
             return Err(format!(
                 "Kalshi order not fully filled (FOK): status={} filled={} remaining={}",
@@ -426,6 +505,11 @@ impl KalshiClient {
             )
             .into());
         }
+
+        info!(
+            "KALSHI ORDER OK | ticker={} side={} action={} | filled={} remaining={} | order_id={}",
+            ticker, side, action, filled, remaining, payload.order.order_id
+        );
 
         Ok(payload.order)
     }
@@ -450,21 +534,26 @@ impl KalshiClient {
         &self,
         market_id: &str,
     ) -> Result<((Option<f64>, Option<f64>), (Option<f64>, Option<f64>)), BoxError> {
-        let yes = self.get_orderbook_depth(&format!("{}_YES", market_id)).await?;
-        let no = self.get_orderbook_depth(&format!("{}_NO", market_id)).await?;
-        let (market_yes_ask, market_no_ask) = self.get_market_prices(market_id).await?;
+        let (market_yes_ask, market_no_ask, market_yes_bid, market_no_bid) =
+            self.get_market_quotes(market_id).await?;
 
-        let yes_best_ask = yes
-            .best_ask
-            .filter(|price| *price > 0.0)
-            .or(market_yes_ask.filter(|price| *price > 0.0 && *price < 1.0));
-        let no_best_ask = no
-            .best_ask
-            .filter(|price| *price > 0.0)
-            .or(market_no_ask.filter(|price| *price > 0.0 && *price < 1.0));
+        let yes_best_ask = market_yes_ask.filter(|price| *price > 0.0 && *price < 1.0);
+        let no_best_ask = market_no_ask.filter(|price| *price > 0.0 && *price < 1.0);
 
-        let yes_bid = yes.bids_depth.first().map(|(price, _)| *price);
-        let no_bid = no.bids_depth.first().map(|(price, _)| *price);
+        // P1 FIX: Removed bid inference from opposite ask (1.0 - no_ask).
+        // In illiquid markets the spread can be wide; the inferred bid would be
+        // artificially high, triggering SL exits at wrong prices.
+        // Now we only return a real bid if the exchange actually quotes one.
+        let yes_bid = market_yes_bid.filter(|price| *price > 0.0 && *price < 1.0);
+        let no_bid = market_no_bid.filter(|price| *price > 0.0 && *price < 1.0);
+
+        if yes_bid.is_none() {
+            log::debug!("Kalshi yes_bid unavailable for {} — no synthetic bid used", market_id);
+        }
+        if no_bid.is_none() {
+            log::debug!("Kalshi no_bid unavailable for {} — no synthetic bid used", market_id);
+        }
+
         Ok(((yes_best_ask, no_best_ask), (yes_bid, no_bid)))
     }
 
@@ -545,6 +634,19 @@ impl KalshiClient {
         Ok(payload.order)
     }
 
+    pub async fn get_portfolio_positions(&self) -> Result<Vec<KalshiPosition>, BoxError> {
+        let path = "/portfolio/positions";
+        let response = self.request_with_auth(Method::GET, path).send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Kalshi get positions failed: {} {}", status, body).into());
+        }
+
+        let payload: GetPositionsResponse = response.json().await?;
+        Ok(payload.positions)
+    }
+
     pub async fn login(&mut self) -> Result<(), BoxError> {
         if self.sign_headers(&Method::GET, "/portfolio").is_some() {
             info!("Kalshi using API key authentication.");
@@ -578,7 +680,10 @@ impl KalshiClient {
         Ok(())
     }
 
-    pub async fn fetch_markets(&self, series: Option<&str>) -> Result<Vec<KalshiRawMarket>, BoxError> {
+    pub async fn fetch_markets(
+        &self,
+        series: Option<&str>,
+    ) -> Result<Vec<KalshiRawMarket>, BoxError> {
         let mut path = "/markets".to_string();
         let mut query = vec![("limit", "1000".to_string())];
         if let Some(series_ticker) = series {
@@ -619,7 +724,11 @@ impl KalshiClient {
     ) -> Result<Vec<KalshiRawMarket>, BoxError> {
         let mut markets = self.fetch_markets(Some(series)).await?;
         markets.retain(|market| {
-            let status = market.status.as_deref().unwrap_or_default().to_ascii_lowercase();
+            let status = market
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             status.contains("settled")
                 || status.contains("final")
                 || status.contains("resolved")
@@ -672,16 +781,23 @@ impl KalshiClient {
             .title
             .clone()
             .unwrap_or_else(|| market.ticker.clone());
-        
+
         // 1. Try floor_strike
         // 2. Try subtitle extraction
         // 3. Fallback: Try title extraction
-        let target_price = market.floor_strike
+        let target_price = market
+            .floor_strike
             .or_else(|| {
-                market.yes_sub_title.as_deref().and_then(extract_target_price_from_subtitle)
+                market
+                    .yes_sub_title
+                    .as_deref()
+                    .and_then(extract_target_price_from_subtitle)
             })
             .or_else(|| {
-                market.title.as_deref().and_then(extract_target_price_from_subtitle)
+                market
+                    .title
+                    .as_deref()
+                    .and_then(extract_target_price_from_subtitle)
             });
 
         let yes_price = market
@@ -753,7 +869,11 @@ impl KalshiClient {
         });
 
         if let Some(current) = markets.iter().find(|market| {
-            let status = market.status.as_deref().unwrap_or_default().to_ascii_lowercase();
+            let status = market
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             if Self::is_closed_status(&status) {
                 return false;
             }
@@ -769,14 +889,22 @@ impl KalshiClient {
         }
 
         if let Some(activeish) = markets.iter().find(|market| {
-            let status = market.status.as_deref().unwrap_or_default().to_ascii_lowercase();
+            let status = market
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             status == "active" || status == "open"
         }) {
             return Some(activeish.clone());
         }
 
         markets.into_iter().find(|market| {
-            let status = market.status.as_deref().unwrap_or_default().to_ascii_lowercase();
+            let status = market
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             !Self::is_closed_status(&status)
         })
     }
@@ -803,7 +931,11 @@ impl KalshiClient {
         for series in ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M"] {
             let markets = self.fetch_markets(Some(series)).await?;
             for market in markets {
-                let status = market.status.as_deref().unwrap_or_default().to_ascii_lowercase();
+                let status = market
+                    .status
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
                 if Self::is_closed_status(&status) {
                     continue;
                 }
@@ -828,7 +960,18 @@ impl KalshiClient {
         Ok(active)
     }
 
-    pub async fn get_market_prices(&self, market_id: &str) -> Result<(Option<f64>, Option<f64>), BoxError> {
+    pub async fn get_market_prices(
+        &self,
+        market_id: &str,
+    ) -> Result<(Option<f64>, Option<f64>), BoxError> {
+        let (yes_ask, no_ask, _, _) = self.get_market_quotes(market_id).await?;
+        Ok((yes_ask, no_ask))
+    }
+
+    pub async fn get_market_quotes(
+        &self,
+        market_id: &str,
+    ) -> Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>), BoxError> {
         let path = format!("/markets/{}", market_id);
         let url = format!("{}{}", self.base_url(), path);
         let mut req = self.client.get(&url);
@@ -857,10 +1000,17 @@ impl KalshiClient {
                             .as_deref()
                             .and_then(parse_decimal_price)
                             .or_else(|| market.no_ask.map(|p| p / 100.0));
-                        return Ok((
-                            yes,
-                            no,
-                        ));
+                        let yes_bid = market
+                            .yes_bid_dollars
+                            .as_deref()
+                            .and_then(parse_decimal_price)
+                            .or_else(|| market.yes_bid.map(|p| p / 100.0));
+                        let no_bid = market
+                            .no_bid_dollars
+                            .as_deref()
+                            .and_then(parse_decimal_price)
+                            .or_else(|| market.no_bid.map(|p| p / 100.0));
+                        return Ok((yes, no, yes_bid, no_bid));
                     }
                 }
             }
@@ -868,7 +1018,7 @@ impl KalshiClient {
             _ => {}
         }
 
-        Ok((None, None))
+        Ok((None, None, None, None))
     }
 
     async fn get_best_ask(&self, market_id: &str, token_id: &str) -> Result<Option<f64>, BoxError> {
@@ -877,7 +1027,10 @@ impl KalshiClient {
         } else {
             format!("{}_NO", market_id)
         };
-        Ok(self.get_orderbook_depth(&synthetic_token_id).await?.best_ask)
+        Ok(self
+            .get_orderbook_depth(&synthetic_token_id)
+            .await?
+            .best_ask)
     }
 
     async fn get_orderbook_depth(&self, token_id: &str) -> Result<OrderbookMetrics, BoxError> {
@@ -903,7 +1056,8 @@ impl KalshiClient {
                     } else {
                         no_asks.clone()
                     };
-                    asks_depth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    asks_depth
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
                     let mut bids_depth: Vec<(f64, f64)> = if is_yes_token {
                         no_asks
@@ -916,7 +1070,8 @@ impl KalshiClient {
                             .map(|(price, size)| ((1.0 - price).clamp(0.0, 1.0), *size))
                             .collect()
                     };
-                    bids_depth.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    bids_depth
+                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
                     let best_bid = bids_depth.first().map(|(price, _)| *price).unwrap_or(0.0);
                     let best_ask = asks_depth.first().map(|(price, _)| *price);
@@ -969,12 +1124,25 @@ impl KalshiClient {
         size: f64,
         market_id: &str,
     ) -> Result<OrderExecution, BoxError> {
-        let side = if token_id.ends_with("_YES") { "yes" } else { "no" };
+        let side = if token_id.ends_with("_YES") {
+            "yes"
+        } else {
+            "no"
+        };
         let count = size.floor() as u32;
         // USE immediate_or_cancel for protective sells to ensure partial closure in low liquidity
-        let order = self.submit_order(market_id, side, "sell", limit_price, count, "immediate_or_cancel").await?;
+        let order = self
+            .submit_order(
+                market_id,
+                side,
+                "sell",
+                limit_price,
+                count,
+                "immediate_or_cancel",
+            )
+            .await?;
         let filled = order.fill_count_fp.parse::<f64>().unwrap_or(0.0);
-        
+
         info!(
             "KALSHI PROTECTIVE SELL | id={} ticker={} side={} limit={:.4} requested={} filled={}",
             order.order_id, market_id, side, limit_price, count, filled
@@ -992,12 +1160,25 @@ impl KalshiClient {
         size: f64,
         market_id: &str,
     ) -> Result<OrderExecution, BoxError> {
-        let side = if token_id.ends_with("_YES") { "yes" } else { "no" };
+        let side = if token_id.ends_with("_YES") {
+            "yes"
+        } else {
+            "no"
+        };
         let count = size.floor() as u32;
         // USE immediate_or_cancel for recovery orders to avoid 409 Conflict rejection if liquidity shifts
-        let order = self.submit_order(market_id, side, "buy", limit_price, count, "immediate_or_cancel").await?;
+        let order = self
+            .submit_order(
+                market_id,
+                side,
+                "buy",
+                limit_price,
+                count,
+                "immediate_or_cancel",
+            )
+            .await?;
         let filled = order.fill_count_fp.parse::<f64>().unwrap_or(0.0);
-        
+
         info!(
             "KALSHI BUY ORDER | id={} ticker={} side={} limit={:.4} requested={} filled={}",
             order.order_id, market_id, side, limit_price, count, filled
@@ -1042,7 +1223,9 @@ fn load_private_key_from_env() -> Option<RsaPrivateKey> {
             .trim_matches('"')
             .replace("\\n", "\n")
             .replace("\r\n", "\n");
-        if let Ok(key) = RsaPrivateKey::from_pkcs8_pem(&pem).or_else(|_| RsaPrivateKey::from_pkcs1_pem(&pem)) {
+        if let Ok(key) =
+            RsaPrivateKey::from_pkcs8_pem(&pem).or_else(|_| RsaPrivateKey::from_pkcs1_pem(&pem))
+        {
             return Some(key);
         }
     }
@@ -1110,7 +1293,7 @@ fn extract_target_price_from_subtitle(text: &str) -> Option<f64> {
             }
         }
     }
-    
+
     // 2. Try naked dollar amount "$12,345.67"
     if let Ok(re) = regex::Regex::new(r"\$([0-9,]+(?:\.[0-9]+)?)") {
         if let Some(caps) = re.captures(text) {
