@@ -3,6 +3,7 @@ pub mod audit;
 pub mod audit_engine;
 pub mod clob_client;
 pub mod config;
+pub mod crisis_supervisor;
 pub mod dual_market;
 pub mod emergency_engine;
 pub mod entry_engine;

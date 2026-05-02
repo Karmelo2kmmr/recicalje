@@ -894,6 +894,54 @@ pub struct ExecutorResponse {
     pub attempts: u32,  // New: Track execution attempts
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderSubmitErrorKind {
+    UnknownAfterTimeout,
+    Rejected,
+    Transport,
+}
+
+pub fn classify_order_submit_error(message: &str) -> OrderSubmitErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        OrderSubmitErrorKind::UnknownAfterTimeout
+    } else if lower.contains("rejected")
+        || lower.contains("zero-fill")
+        || lower.contains("zero filled")
+        || lower.contains("not enough")
+    {
+        OrderSubmitErrorKind::Rejected
+    } else {
+        OrderSubmitErrorKind::Transport
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownOrderReconcileResult {
+    pub found: bool,
+    pub filled_size: f64,
+    pub order_id: Option<String>,
+}
+
+pub async fn reconcile_unknown_order(
+    client_order_id: &str,
+) -> Result<UnknownOrderReconcileResult, Box<dyn Error>> {
+    if client_order_id.trim().is_empty() || !is_live_mode() {
+        return Ok(UnknownOrderReconcileResult {
+            found: false,
+            filled_size: 0.0,
+            order_id: None,
+        });
+    }
+
+    let resp = call_executor(&["find_order", client_order_id]).await?;
+    Ok(UnknownOrderReconcileResult {
+        found: resp.shares > 0.0 || resp.order_id != "unknown",
+        filled_size: resp.shares,
+        order_id: Some(resp.order_id),
+    })
+}
+
 /// Run clob_executor.py asynchronously and parse JSON response.
 /// Returns the ExecutorResponse on success, or an error message.
 async fn call_executor(args: &[&str]) -> Result<ExecutorResponse, Box<dyn Error>> {
@@ -998,7 +1046,8 @@ async fn call_executor(args: &[&str]) -> Result<ExecutorResponse, Box<dyn Error>
             return Err(format!(
                 "Sell zero-fill: status:ok but no shares sold (order_id={}). Position still open.",
                 order_id
-            ).into());
+            )
+            .into());
         }
 
         let fill_price = parsed["average_fill_price"].as_f64();
@@ -1008,7 +1057,11 @@ async fn call_executor(args: &[&str]) -> Result<ExecutorResponse, Box<dyn Error>
 
         info!(
             "EXECUTOR OK | cmd={} | order_id={} | shares={:.6} | fill_price={:?} | reliable={}",
-            args.first().copied().unwrap_or("?"), order_id, shares, fill_price, reliable
+            args.first().copied().unwrap_or("?"),
+            order_id,
+            shares,
+            fill_price,
+            reliable
         );
 
         Ok(ExecutorResponse {
@@ -1129,6 +1182,18 @@ pub async fn get_order_status(order_id: &str) -> Result<String, Box<dyn Error>> 
             log::warn!("Order {} lookup failed: {}", order_id, e);
             Ok("UNKNOWN".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod unknown_order_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_error_marks_order_status_unknown() {
+        let result = classify_order_submit_error("Python executor TIMED OUT after 20s");
+
+        assert_eq!(result, OrderSubmitErrorKind::UnknownAfterTimeout);
     }
 }
 
@@ -1546,7 +1611,10 @@ pub async fn place_market_sell(
     // Now: respect the caller's intent exactly, only clamp to a valid range.
     let effective_limit_price = limit_price.clamp(0.01, 0.99);
     if limit_price < 0.02 {
-        warn!("NUCLEAR SELL: limit_price={:.4} — selling at floor to guarantee exit", effective_limit_price);
+        warn!(
+            "NUCLEAR SELL: limit_price={:.4} — selling at floor to guarantee exit",
+            effective_limit_price
+        );
     }
 
     if is_live_mode() {

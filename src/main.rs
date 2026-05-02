@@ -1,12 +1,16 @@
 use arbitrage_hammer::api;
 use arbitrage_hammer::clob_client::PolymarketClobClient;
 use arbitrage_hammer::config;
+use arbitrage_hammer::crisis_supervisor::{CrisisInputs, CrisisLevel, CrisisSupervisor};
 use arbitrage_hammer::dual_market::{
     DualCapitalManager, DualMarketPair, OpenPosition, Platform, PositionState, Venue,
 };
-use arbitrage_hammer::execution_engine::{Poly425Decision, Poly425Guard};
+use arbitrage_hammer::execution_engine::{should_enter_expiry_hold, Poly425Decision, Poly425Guard};
 use arbitrage_hammer::kalshi_client::KalshiClient;
 use arbitrage_hammer::telegram::TelegramBot;
+use arbitrage_hammer::venue_anomaly_engine::{
+    evaluate_entry_gate, EntryGateConfig, EntryGateInputs,
+};
 use chrono::{DateTime, Local, Timelike};
 use log::{error, info, warn};
 use std::collections::HashSet;
@@ -177,6 +181,46 @@ mod tests {
         assert!(entries_allowed_by_safe_mode(false));
         assert!(!entries_allowed_by_safe_mode(true));
     }
+
+    #[test]
+    fn retrace_exit_below_floor_routes_to_recovery() {
+        assert!(should_route_illiquid_exit_to_recovery(
+            "BINANCE-RETRACE",
+            0.07,
+            0.47
+        ));
+        assert!(!should_route_illiquid_exit_to_recovery(
+            "BINANCE-RETRACE",
+            0.48,
+            0.47
+        ));
+        assert!(!should_route_illiquid_exit_to_recovery(
+            "TAKE-PROFIT",
+            0.07,
+            0.47
+        ));
+    }
+
+    #[test]
+    fn illiquid_recovery_retry_does_not_nuclear_dump() {
+        let price = recovery_retry_exit_price(
+            3,
+            0.07,
+            0.47,
+            Some("IlliquidExit BINANCE-RETRACE bid 0.0700 below floor 0.4700"),
+        );
+
+        assert_eq!(price, 0.47);
+    }
+
+    #[test]
+    fn exit_depth_preflight_blocks_thin_book() {
+        let bids = vec![(0.90, 1.0), (0.89, 2.0), (0.40, 100.0)];
+
+        assert_eq!(bid_depth_at_or_above(&bids, 0.89), 3.0);
+        assert!(exit_depth_insufficient(&bids, 0.89, 3.0, 1.25));
+        assert!(!exit_depth_insufficient(&bids, 0.89, 2.0, 1.25));
+    }
 }
 
 struct CloseFill {
@@ -274,6 +318,107 @@ fn reconcile_close_fill(
     pos.last_error = None;
     pos.updated_at = Some(now_rfc3339());
     Ok(true)
+}
+
+fn should_route_illiquid_exit_to_recovery(
+    reason: &str,
+    reference_price: f64,
+    recovery_floor: f64,
+) -> bool {
+    matches!(reason, "BINANCE-RETRACE" | "HARD-SL")
+        && reference_price > 0.0
+        && recovery_floor > 0.0
+        && reference_price < recovery_floor
+}
+
+fn mark_illiquid_exit_for_recovery(
+    pos: &mut OpenPosition,
+    reason: &str,
+    reference_price: f64,
+    recovery_floor: f64,
+) {
+    pos.state = PositionState::RecoveryPending;
+    pos.last_error = Some(format!(
+        "IlliquidExit {} bid {:.4} below recovery floor {:.4}; position remains open",
+        reason, reference_price, recovery_floor
+    ));
+    pos.updated_at = Some(now_rfc3339());
+}
+
+fn recovery_retry_exit_price(
+    fail_count: u32,
+    reference_price: f64,
+    recovery_floor: f64,
+    last_error: Option<&str>,
+) -> f64 {
+    if last_error
+        .map(|e| e.contains("IlliquidExit"))
+        .unwrap_or(false)
+    {
+        return reference_price.max(recovery_floor).clamp(0.01, 0.99);
+    }
+
+    if fail_count == 0 {
+        (reference_price - 0.05).max(0.01)
+    } else if fail_count == 1 {
+        (reference_price - 0.15).max(0.01)
+    } else {
+        0.01
+    }
+}
+
+fn bid_depth_at_or_above(bids: &[(f64, f64)], floor: f64) -> f64 {
+    bids.iter()
+        .filter(|(price, _)| *price >= floor)
+        .map(|(_, size)| *size)
+        .sum()
+}
+
+fn exit_depth_insufficient(
+    bids: &[(f64, f64)],
+    floor: f64,
+    shares: f64,
+    min_depth_ratio: f64,
+) -> bool {
+    if shares <= 0.0 {
+        return true;
+    }
+    bid_depth_at_or_above(bids, floor) < shares * min_depth_ratio.max(1.0)
+}
+
+fn quote_spread_pct(ask: f64, bid: f64) -> f64 {
+    if ask <= 0.0 || bid <= 0.0 {
+        return 1.0;
+    }
+    ((ask - bid).max(0.0) / ask).clamp(0.0, 1.0)
+}
+
+fn entry_edge_confidence(quote_age_ms: u64, spread_pct: f64) -> f64 {
+    (100.0 - (spread_pct * 1_000.0) - (quote_age_ms as f64 / 100.0)).clamp(0.0, 100.0)
+}
+
+fn theoretical_expiry_confidence(
+    buy_yes: bool,
+    binance_price: f64,
+    strike: f64,
+    seconds_to_expiry: i64,
+) -> f64 {
+    if seconds_to_expiry < 0 || strike <= 0.0 {
+        return 0.0;
+    }
+    let distance_ratio = ((binance_price - strike).abs() / strike).clamp(0.0, 1.0);
+    let itm = if buy_yes {
+        binance_price > strike
+    } else {
+        binance_price < strike
+    };
+    if itm && distance_ratio >= 0.001 {
+        0.95
+    } else if itm {
+        0.75
+    } else {
+        0.0
+    }
 }
 
 fn entries_allowed_by_safe_mode(safe_mode_active: bool) -> bool {
@@ -1321,7 +1466,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dca_size_factor = env_f64("DCA_SIZE_FACTOR", 0.5);
     let entry_start_secs = env_i32("ENTRY_START_SEC", 540);
     let entry_end_secs = env_i32("ENTRY_END_SEC", 790);
-    let mut safe_mode_active = false;
+    let mut safe_mode_active: bool;
+    let mut crisis_supervisor = CrisisSupervisor::from_env();
+    let entry_gate_config = EntryGateConfig::default();
+    let mut consecutive_timeouts = 0u32;
+    let mut consecutive_partial_fills = 0u32;
+    let mut consecutive_desync_failures = 0u32;
+    let mut entry_unknown_pending_reconcile = false;
     let mut last_alert_times: std::collections::HashMap<String, chrono::DateTime<chrono::Local>> =
         std::collections::HashMap::new();
 
@@ -1475,8 +1626,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | PositionState::RecoveryPending
                     | PositionState::ManualReviewRequired
                     | PositionState::ExpiredPendingResolution
+                    | PositionState::ExpiryHold
+                    | PositionState::EntryUnknownPendingReconcile
             )
         });
+        let crisis_level = crisis_supervisor.evaluate(CrisisInputs {
+            consecutive_timeouts,
+            consecutive_partial_fills,
+            consecutive_desync_failures,
+            locked_funds_ratio: 0.0,
+            price_staleness_ms: 0,
+        });
+        if crisis_level >= CrisisLevel::Critical {
+            safe_mode_active = true;
+            warn!(
+                "CRISIS SUPERVISOR {:?} | entries blocked | inputs={:?}",
+                crisis_level,
+                crisis_supervisor.inputs()
+            );
+        }
 
         let mut scan_total = 0usize;
         let mut scan_no_signal = 0usize;
@@ -1562,6 +1730,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         | PositionState::ExpiredPendingResolution
                         | PositionState::ResolvedConfirmed
                         | PositionState::ManualReviewRequired
+                        | PositionState::EntryUnknownPendingReconcile
                 ) && !pos.is_hedge
                 {
                     j += 1;
@@ -1627,18 +1796,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     let sf_ref = if sf_bid > 0.0 { sf_bid } else { sf_ask };
 
-                    // Escalation ladder: each failed attempt uses a steeper discount.
-                    // After 3 failures we go nuclear (floor = 0.01).
-                    let exit_price = if fail_count == 0 {
-                        // First retry: bid minus 5% slippage
-                        (sf_ref - 0.05).max(0.01)
-                    } else if fail_count == 1 {
-                        // Second retry: bid minus 15% — more aggressive
-                        (sf_ref - 0.15).max(0.01)
-                    } else {
-                        // Nuclear: sell at floor no matter what to guarantee exit
-                        0.01
-                    };
+                    let exit_price = recovery_retry_exit_price(
+                        fail_count,
+                        sf_ref,
+                        hard_sl_exit_floor,
+                        pos.last_error.as_deref(),
+                    );
 
                     warn!(
                         "STOP-FAILED RETRY | coin={} ticker={} venue={:?} attempt={} exit_price={:.4} bid={:.4}",
@@ -1673,6 +1836,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    consecutive_partial_fills =
+                                        consecutive_partial_fills.saturating_add(1);
                                     let proceeds = fill.shares_sold * fill.fill_price;
                                     capital_manager.add(&pos.venue_platform(), proceeds);
                                     if let Some(bot) = telegram_bot.as_ref() {
@@ -1805,6 +1970,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         binance_price > pos.binance_entry_price + pos.binance_retrace_threshold
                     };
                     if triggered {
+                        if should_route_illiquid_exit_to_recovery(
+                            "BINANCE-RETRACE",
+                            stop_ref,
+                            hard_sl_exit_floor,
+                        ) {
+                            mark_illiquid_exit_for_recovery(
+                                &mut open_positions[j],
+                                "BINANCE-RETRACE",
+                                stop_ref,
+                                hard_sl_exit_floor,
+                            );
+                            safe_mode_active = true;
+                            if let Some(bot) = telegram_bot.as_ref() {
+                                bot.send_message(&format!(
+                                    "*RECOVERY ACTIVADO - LIQUIDEZ INSUFICIENTE*\nActivo: `{}`\nVenue: `{:?}`\nMotivo: `BINANCE-RETRACE`\nBid: `{:.3}`\nFloor recovery: `{:.3}`\nLa posicion sigue abierta; no se vendera barriendo el orderbook.",
+                                    pos.coin, pos.venue, stop_ref, hard_sl_exit_floor
+                                ))
+                                .await;
+                            }
+                            save_state(&open_positions);
+                            j += 1;
+                            continue;
+                        }
+                        if pos.venue == Venue::Polymarket {
+                            let depth_metrics =
+                                api::get_orderbook_depth(&http_client, pos.pm_token_id()).await;
+                            let min_depth_ratio = env_f64("MIN_EXIT_DEPTH_RATIO", 1.25);
+                            if exit_depth_insufficient(
+                                &depth_metrics.bids_depth,
+                                hard_sl_exit_floor,
+                                pos.shares,
+                                min_depth_ratio,
+                            ) {
+                                mark_illiquid_exit_for_recovery(
+                                    &mut open_positions[j],
+                                    "BINANCE-RETRACE",
+                                    stop_ref,
+                                    hard_sl_exit_floor,
+                                );
+                                safe_mode_active = true;
+                                warn!(
+                                    "BINANCE-RETRACE exit blocked by thin depth | coin={} shares={:.4} bid_depth_floor={:.4} required={:.4}",
+                                    pos.coin,
+                                    pos.shares,
+                                    bid_depth_at_or_above(&depth_metrics.bids_depth, hard_sl_exit_floor),
+                                    pos.shares * min_depth_ratio
+                                );
+                                if let Some(bot) = telegram_bot.as_ref() {
+                                    bot.send_message(&format!(
+                                        "*RECOVERY ACTIVADO - ORDERBOOK FINO*\nActivo: `{}`\nVenue: `{:?}`\nMotivo: `BINANCE-RETRACE`\nBid: `{:.3}`\nDepth floor: `{:.4}`\nRequerido: `{:.4}`\nLa posicion sigue abierta; no se vendera con liquidez insuficiente.",
+                                        pos.coin,
+                                        pos.venue,
+                                        stop_ref,
+                                        bid_depth_at_or_above(&depth_metrics.bids_depth, hard_sl_exit_floor),
+                                        pos.shares * min_depth_ratio
+                                    ))
+                                    .await;
+                                }
+                                save_state(&open_positions);
+                                j += 1;
+                                continue;
+                            }
+                        }
                         let res = if pos.venue == Venue::Polymarket {
                             close_polymarket_position(
                                 &http_client,
@@ -1835,6 +2063,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ) {
                                     Ok(true) => {}
                                     Ok(false) => {
+                                        consecutive_partial_fills =
+                                            consecutive_partial_fills.saturating_add(1);
                                         let proceeds = fill.shares_sold * fill.fill_price;
                                         capital_manager.add(&pos.venue_platform(), proceeds);
                                         warn!(
@@ -1921,6 +2151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    consecutive_partial_fills =
+                                        consecutive_partial_fills.saturating_add(1);
                                     let proceeds = fill.shares_sold * fill.fill_price;
                                     capital_manager.add(&pos.venue_platform(), proceeds);
                                     if let Some(bot) = telegram_bot.as_ref() {
@@ -2026,6 +2258,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match reconcile_close_fill(&mut open_positions[j], &fill, "HARD-SL") {
                                 Ok(true) => {}
                                 Ok(false) => {
+                                    consecutive_partial_fills =
+                                        consecutive_partial_fills.saturating_add(1);
                                     let proceeds = fill.shares_sold * fill.fill_price;
                                     capital_manager.add(&pos.venue_platform(), proceeds);
                                     warn!(
@@ -2086,6 +2320,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let sl_liquidity_threshold = env_f64("SL_LIQUIDITY_THRESHOLD", 0.23);
                             if allow_cross_venue_hedge && stop_ref <= sl_liquidity_threshold {
+                                let seconds_to_expiry = (900 - elapsed_secs).max(0) as i64;
+                                let expiry_confidence = theoretical_expiry_confidence(
+                                    pos.buy_yes,
+                                    binance_price,
+                                    if pos.venue == Venue::Polymarket {
+                                        twin.pm_strike
+                                    } else {
+                                        twin.km_strike
+                                    },
+                                    seconds_to_expiry,
+                                );
+                                if should_enter_expiry_hold(seconds_to_expiry, expiry_confidence) {
+                                    open_positions[j].state = PositionState::ExpiryHold;
+                                    open_positions[j].last_error = Some(format!(
+                                        "ExpiryHold: no hedge near expiry ({}s, confidence {:.2})",
+                                        seconds_to_expiry, expiry_confidence
+                                    ));
+                                    open_positions[j].updated_at = Some(now_rfc3339());
+                                    if let Some(bot) = telegram_bot.as_ref() {
+                                        bot.send_message(&format!(
+                                            "*EXPIRY HOLD ACTIVADO*\nActivo: `{}`\nMotivo: `NO_HEDGE_NEAR_EXPIRY`\nSegundos: `{}`\nConfianza: `{:.2}`",
+                                            twin.coin, seconds_to_expiry, expiry_confidence
+                                        ))
+                                        .await;
+                                    }
+                                    save_state(&open_positions);
+                                    j += 1;
+                                    continue;
+                                }
+
                                 let hedge_buy_yes = !pos.buy_yes;
                                 let hedge_size = env_f64("HEDGE_SIZE", position_size);
                                 let pm_hedge_ask = if hedge_buy_yes {
@@ -2316,6 +2580,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scan_no_signal += 1;
             }
             if !has_pos && entry_signal {
+                if entry_unknown_pending_reconcile {
+                    scan_safe_mode += 1;
+                    warn!(
+                        "ENTRY BLOCKED {} | previous order timed out with unknown exchange status; reconcile before new entry",
+                        twin.coin
+                    );
+                    continue;
+                }
+
                 if !entries_allowed_by_safe_mode(safe_mode_active) {
                     scan_safe_mode += 1;
                     warn!(
@@ -2369,6 +2642,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                         .unwrap_or(0.0)
                 };
+                let pm_bid = if buy_yes {
+                    api::get_best_bid(&http_client, &twin.pm_yes_token)
+                        .await
+                        .unwrap_or(0.0)
+                } else {
+                    api::get_best_bid(&http_client, &twin.pm_no_token)
+                        .await
+                        .unwrap_or(0.0)
+                };
                 if pm_ask > 0.0 {
                     poly_425_guard.record_orderbook_seen(&twin.kalshi_ticker);
                     if poly_425_guard.is_latency_high(&twin.kalshi_ticker) {
@@ -2378,7 +2660,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
-                let ((ky_ask, kn_ask), (_ky_bid, _kn_bid)) = kalshi_client
+                let ((ky_ask, kn_ask), (ky_bid, kn_bid)) = kalshi_client
                     .get_outcome_top_of_book(&twin.kalshi_ticker)
                     .await
                     .unwrap_or(((None, None), (None, None)));
@@ -2386,6 +2668,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ky_ask.unwrap_or(0.0)
                 } else {
                     kn_ask.unwrap_or(0.0)
+                };
+                let km_bid = if buy_yes {
+                    ky_bid.unwrap_or(0.0)
+                } else {
+                    kn_bid.unwrap_or(0.0)
                 };
 
                 let poly_has_funds = if paper_mode || pm_ask <= 0.0 {
@@ -2443,6 +2730,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 } else if selection.ask <= startup.max_entry_price {
                     scan_attemptable += 1;
+                    let quote_age_ms = if selection.platform == Platform::Polymarket {
+                        poly_425_guard.latency_score_ms(&twin.kalshi_ticker)
+                    } else {
+                        0
+                    };
+                    let selected_bid = if selection.platform == Platform::Polymarket {
+                        pm_bid
+                    } else {
+                        km_bid
+                    };
+                    let spread_pct = quote_spread_pct(selection.ask, selected_bid);
+                    let edge_confidence = entry_edge_confidence(quote_age_ms, spread_pct);
+                    let gate = evaluate_entry_gate(
+                        &entry_gate_config,
+                        EntryGateInputs {
+                            quote_age_ms,
+                            spread_pct,
+                            edge_confidence,
+                        },
+                    );
+                    if !gate.allowed {
+                        consecutive_desync_failures = consecutive_desync_failures.saturating_add(1);
+                        scan_price_blocked += 1;
+                        warn!(
+                            "ENTRY BLOCKED {} | stale/desync gate reason={} quote_age_ms={} spread_pct={:.4} edge_confidence={:.1}",
+                            twin.coin,
+                            gate.reason.as_deref().unwrap_or("UNKNOWN"),
+                            quote_age_ms,
+                            spread_pct,
+                            edge_confidence
+                        );
+                        continue;
+                    }
+
                     let chosen_venue_enum = if selection.platform == Platform::Polymarket {
                         Venue::Polymarket
                     } else {
@@ -2526,6 +2847,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match res {
                         Ok(fill) => {
+                            consecutive_timeouts = 0;
+                            consecutive_desync_failures = 0;
+                            entry_unknown_pending_reconcile = false;
                             if selection.platform == Platform::Polymarket {
                                 poly_425_guard.record_success(&twin.kalshi_ticker);
                             }
@@ -2585,6 +2909,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "ENTRY FAILED {} | venue={} ask={:.3} error={}",
                                 twin.coin, selection.venue, selection.ask, e
                             );
+                            if api::classify_order_submit_error(&e)
+                                == api::OrderSubmitErrorKind::UnknownAfterTimeout
+                            {
+                                consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+                                entry_unknown_pending_reconcile = true;
+                                safe_mode_active = true;
+                                warn!(
+                                    "ENTRY UNKNOWN {} | order placement timed out; blocking new entries until reconciliation",
+                                    twin.coin
+                                );
+                            }
                             let mut silent_telegram = false;
                             if selection.platform == Platform::Polymarket && is_poly_425_error(&e) {
                                 let outcome = poly_425_guard.record_425(&twin.kalshi_ticker);

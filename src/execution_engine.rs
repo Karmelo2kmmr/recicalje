@@ -171,6 +171,13 @@ impl Poly425Guard {
             .unwrap_or(false)
     }
 
+    pub fn latency_score_ms(&self, market_key: &str) -> u64 {
+        self.markets
+            .get(market_key)
+            .map(|state| state.latency_score_ms)
+            .unwrap_or(0)
+    }
+
     pub fn is_orderbook_desynced(&self, market_key: &str) -> bool {
         let Some(state) = self.markets.get(market_key) else {
             return false;
@@ -183,6 +190,27 @@ impl Poly425Guard {
         };
         seen > success
             && seen.duration_since(success).as_millis() as u64 > Self::latency_window_ms()
+    }
+}
+
+pub fn should_enter_expiry_hold(seconds_to_expiry: i64, theoretical_confidence: f64) -> bool {
+    let min_hedge_seconds = env_u64("MIN_HEDGE_SECONDS_TO_EXPIRY", 180) as i64;
+    let min_confidence = env_f64("EXPIRY_HOLD_MIN_CONFIDENCE", 0.90);
+
+    seconds_to_expiry >= 0
+        && seconds_to_expiry <= min_hedge_seconds
+        && theoretical_confidence >= min_confidence
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_mode_blocks_expensive_hedge_near_close() {
+        assert!(should_enter_expiry_hold(60, 0.92));
+        assert!(!should_enter_expiry_hold(240, 0.92));
+        assert!(!should_enter_expiry_hold(60, 0.70));
     }
 }
 

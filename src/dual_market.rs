@@ -22,6 +22,7 @@ pub enum PositionState {
     Hedged,
     Unwinding,
     ExpiryHold,
+    EntryUnknownPendingReconcile,
     Closed,
 }
 

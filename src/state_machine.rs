@@ -9,6 +9,7 @@ pub enum PositionState {
     RecoveryScanning,
     DesyncMonitoring, // Mithos Omega Anomaly state
     EmergencyExiting, // Capital Protection Engine state
+    EntryUnknownPendingReconcile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +49,13 @@ impl StateMachine {
             PositionState::InPosition | PositionState::PendingDCA | PositionState::Exiting => true,
             _ => false,
         }
+    }
+
+    pub fn blocks_new_entries(&self) -> bool {
+        matches!(
+            self.current_state,
+            PositionState::EntryUnknownPendingReconcile | PositionState::EmergencyExiting
+        )
     }
 
     pub fn reset(&mut self) {
