@@ -2313,11 +2313,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 e,
                             )
                             .await;
-                            let allow_cross_venue_hedge = if startup.live_mode {
-                                env_bool("ALLOW_LIVE_CROSS_VENUE_HEDGE", false)
-                            } else {
-                                env_bool("ALLOW_CROSS_VENUE_HEDGE", false)
-                            };
+                            let allow_cross_venue_hedge =
+                                match config::cross_venue_hedge_enabled(startup.live_mode) {
+                                    Ok(enabled) => enabled,
+                                    Err(config_error) => {
+                                        warn!(
+                                            "Cross-venue hedge disabled by invalid config | error={}",
+                                            config_error
+                                        );
+                                        false
+                                    }
+                                };
                             let sl_liquidity_threshold = env_f64("SL_LIQUIDITY_THRESHOLD", 0.23);
                             if allow_cross_venue_hedge && stop_ref <= sl_liquidity_threshold {
                                 let seconds_to_expiry = (900 - elapsed_secs).max(0) as i64;
@@ -2397,7 +2403,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     km_hedge_ask
                                 };
 
-                                if hedge_ask > 0.0 && hedge_ask <= startup.max_entry_price {
+                                let max_hedge_price =
+                                    env_f64("MAX_HEDGE_PRICE", 0.45).min(startup.max_entry_price);
+                                if hedge_ask > 0.0 && hedge_ask <= max_hedge_price {
                                     let hedge_res = if hedge_platform == Platform::Polymarket {
                                         execute_polymarket_entry(
                                             &http_client,

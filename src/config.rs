@@ -17,6 +17,8 @@ pub struct StartupConfig {
     pub hard_sl_exit_floor: f64,
 }
 
+pub const LIVE_CROSS_VENUE_HEDGE_ACK: &str = "I_UNDERSTAND_LIVE_HEDGE_RECOVERY";
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -62,6 +64,81 @@ fn env_usize(name: &str, default: usize) -> Result<usize, String> {
             .map_err(|_| format!("{name} must be an integer, got '{}'", value.trim())),
         Err(_) => Ok(default),
     }
+}
+
+pub fn cross_venue_hedge_enabled(live_mode: bool) -> Result<bool, String> {
+    if live_mode {
+        env_bool("ALLOW_LIVE_CROSS_VENUE_HEDGE", false)
+    } else {
+        env_bool("ALLOW_CROSS_VENUE_HEDGE", false)
+    }
+}
+
+pub fn validate_live_cross_venue_hedge_settings(
+    enabled: bool,
+    ack: Option<&str>,
+    hedge_size: f64,
+    position_size: f64,
+    max_total_exposure_usdc: f64,
+    max_venue_exposure_usdc: f64,
+    max_hedge_price: f64,
+    sl_liquidity_threshold: f64,
+    hedge_sl_gap: f64,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+
+    if ack != Some(LIVE_CROSS_VENUE_HEDGE_ACK) {
+        return Err(format!(
+            "LIVE_CROSS_VENUE_HEDGE_ACK={} is required when ALLOW_LIVE_CROSS_VENUE_HEDGE=true.",
+            LIVE_CROSS_VENUE_HEDGE_ACK
+        ));
+    }
+
+    if !hedge_size.is_finite() || hedge_size <= 0.0 {
+        return Err(format!(
+            "HEDGE_SIZE ({:.4}) must be a positive finite USDC value.",
+            hedge_size
+        ));
+    }
+
+    if hedge_size > position_size {
+        return Err(format!(
+            "HEDGE_SIZE ({:.2}) cannot exceed POSITION_SIZE ({:.2}) for live recovery.",
+            hedge_size, position_size
+        ));
+    }
+
+    if hedge_size > max_total_exposure_usdc || hedge_size > max_venue_exposure_usdc {
+        return Err(format!(
+            "HEDGE_SIZE ({:.2}) must fit max exposure limits ({:.2}/{:.2}).",
+            hedge_size, max_total_exposure_usdc, max_venue_exposure_usdc
+        ));
+    }
+
+    if !(0.01..=0.95).contains(&max_hedge_price) {
+        return Err(format!(
+            "MAX_HEDGE_PRICE ({:.4}) must stay between 0.01 and 0.95.",
+            max_hedge_price
+        ));
+    }
+
+    if !(0.0..=0.95).contains(&sl_liquidity_threshold) {
+        return Err(format!(
+            "SL_LIQUIDITY_THRESHOLD ({:.4}) must stay between 0.00 and 0.95.",
+            sl_liquidity_threshold
+        ));
+    }
+
+    if !(0.0..=0.95).contains(&hedge_sl_gap) {
+        return Err(format!(
+            "HEDGE_SL_GAP ({:.4}) must stay between 0.00 and 0.95.",
+            hedge_sl_gap
+        ));
+    }
+
+    Ok(())
 }
 
 fn looks_like_placeholder(value: &str) -> bool {
@@ -229,12 +306,17 @@ pub fn validate_startup() -> Result<StartupConfig, String> {
             );
         }
 
-        if env_bool("ALLOW_LIVE_CROSS_VENUE_HEDGE", false)? {
-            return Err(
-                "ALLOW_LIVE_CROSS_VENUE_HEDGE=true is disabled by startup safety. Keep live hedge off until separately reviewed."
-                    .to_string(),
-            );
-        }
+        validate_live_cross_venue_hedge_settings(
+            cross_venue_hedge_enabled(true)?,
+            env_string("LIVE_CROSS_VENUE_HEDGE_ACK").as_deref(),
+            env_f64("HEDGE_SIZE", position_size)?,
+            position_size,
+            max_total_exposure_usdc,
+            max_venue_exposure_usdc,
+            env_f64("MAX_HEDGE_PRICE", 0.45)?,
+            env_f64("SL_LIQUIDITY_THRESHOLD", 0.23)?,
+            env_f64("HEDGE_SL_GAP", 0.18)?,
+        )?;
 
         for key in ["KALSHI_ACCESS_KEY"] {
             let value = env_string(key)
@@ -316,4 +398,44 @@ pub fn validate_startup() -> Result<StartupConfig, String> {
         hard_sl_price,
         hard_sl_exit_floor,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_cross_venue_hedge_requires_explicit_ack() {
+        let result = validate_live_cross_venue_hedge_settings(
+            true,
+            Some("WRONG"),
+            3.0,
+            3.0,
+            10.0,
+            10.0,
+            0.45,
+            0.23,
+            0.18,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("LIVE_CROSS_VENUE_HEDGE_ACK"));
+    }
+
+    #[test]
+    fn live_cross_venue_hedge_accepts_audited_small_recovery() {
+        let result = validate_live_cross_venue_hedge_settings(
+            true,
+            Some(LIVE_CROSS_VENUE_HEDGE_ACK),
+            3.0,
+            3.0,
+            10.0,
+            10.0,
+            0.45,
+            0.23,
+            0.18,
+        );
+
+        assert!(result.is_ok());
+    }
 }
