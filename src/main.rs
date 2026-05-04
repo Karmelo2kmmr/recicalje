@@ -177,6 +177,20 @@ mod tests {
     }
 
     #[test]
+    fn manual_review_and_expired_positions_remain_recoverable() {
+        let mut manual = test_position();
+        manual.state = PositionState::ManualReviewRequired;
+
+        let mut expired = test_position();
+        expired.state = PositionState::ExpiredPendingResolution;
+
+        assert!(is_recoverable_exit_state(&manual.state));
+        assert!(is_recoverable_exit_state(&expired.state));
+        assert!(!should_skip_position_management(&manual));
+        assert!(!should_skip_position_management(&expired));
+    }
+
+    #[test]
     fn safe_mode_blocks_new_entries() {
         assert!(entries_allowed_by_safe_mode(false));
         assert!(!entries_allowed_by_safe_mode(true));
@@ -423,6 +437,32 @@ fn theoretical_expiry_confidence(
 
 fn entries_allowed_by_safe_mode(safe_mode_active: bool) -> bool {
     !safe_mode_active
+}
+
+fn is_recoverable_exit_state(state: &PositionState) -> bool {
+    matches!(
+        state,
+        PositionState::RecoveryPending
+            | PositionState::ExitFailedZeroFill
+            | PositionState::ManualReviewRequired
+            | PositionState::ExpiredPendingResolution
+    )
+}
+
+fn should_skip_position_management(pos: &OpenPosition) -> bool {
+    matches!(
+        pos.state,
+        PositionState::StopPending
+            | PositionState::HedgeEvaluating
+            | PositionState::HedgePending
+            | PositionState::Hedged
+            | PositionState::Unwinding
+            | PositionState::ExpiryHold
+            | PositionState::Closed
+            | PositionState::ClosedConfirmed
+            | PositionState::ResolvedConfirmed
+            | PositionState::EntryUnknownPendingReconcile
+    ) && !pos.is_hedge
 }
 
 fn is_terminal_zero_position(pos: &OpenPosition) -> bool {
@@ -1565,6 +1605,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ));
                             open_positions[j].updated_at = Some(now_rfc3339());
                             save_state(&open_positions);
+
+                            let ticker = open_positions[j].kalshi_ticker.clone();
+                            let buy_yes = open_positions[j].buy_yes;
+                            let shares = open_positions[j].shares;
+                            let ((ky_ask, kn_ask), (ky_bid, kn_bid)) = kalshi_client
+                                .get_outcome_top_of_book(&ticker)
+                                .await
+                                .unwrap_or(((None, None), (None, None)));
+                            let stale_bid = if buy_yes {
+                                ky_bid.or(ky_ask)
+                            } else {
+                                kn_bid.or(kn_ask)
+                            }
+                            .unwrap_or(0.0);
+
+                            if stale_bid > 0.0 {
+                                warn!(
+                                    "STALE RECOVERY | attempting Kalshi close outside active twin list | ticker={} shares={:.4} price={:.4}",
+                                    ticker, shares, stale_bid
+                                );
+                                match close_kalshi_position(
+                                    &kalshi_client,
+                                    &ticker,
+                                    buy_yes,
+                                    shares,
+                                    stale_bid,
+                                    paper_mode,
+                                )
+                                .await
+                                {
+                                    Ok(fill) => match reconcile_close_fill(
+                                        &mut open_positions[j],
+                                        &fill,
+                                        "STALE-RECOVERY",
+                                    ) {
+                                        Ok(true) => {
+                                            open_positions[j].last_exit_order_id = fill.order_id;
+                                            open_positions.remove(j);
+                                            save_state(&open_positions);
+                                            continue;
+                                        }
+                                        Ok(false) => {
+                                            save_state(&open_positions);
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "STALE RECOVERY Kalshi close unconfirmed | ticker={} error={}",
+                                                ticker, e
+                                            );
+                                            save_state(&open_positions);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        alert_close_failure(
+                                            telegram_bot.as_ref(),
+                                            &mut open_positions[j],
+                                            "STALE-RECOVERY",
+                                            e,
+                                        )
+                                        .await;
+                                        save_state(&open_positions);
+                                    }
+                                }
+                            }
                         }
                     } else {
                         // Not in portfolio -> resolved
@@ -1604,6 +1708,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ));
                         open_positions[j].updated_at = Some(now_rfc3339());
                         save_state(&open_positions);
+
+                        let token = open_positions[j].pm_token_id().to_string();
+                        let shares = open_positions[j].shares;
+                        let stale_bid =
+                            api::get_best_bid(&http_client, &token).await.unwrap_or(0.0);
+
+                        if stale_bid > 0.0 {
+                            warn!(
+                                "STALE RECOVERY | attempting Polymarket close outside active twin list | token={} shares={:.4} price={:.4}",
+                                token, shares, stale_bid
+                            );
+                            match close_polymarket_position(
+                                &http_client,
+                                &poly_client,
+                                &token,
+                                shares,
+                                stale_bid,
+                                paper_mode,
+                            )
+                            .await
+                            {
+                                Ok(fill) => match reconcile_close_fill(
+                                    &mut open_positions[j],
+                                    &fill,
+                                    "STALE-RECOVERY",
+                                ) {
+                                    Ok(true) => {
+                                        open_positions[j].last_exit_order_id = fill.order_id;
+                                        open_positions.remove(j);
+                                        save_state(&open_positions);
+                                        continue;
+                                    }
+                                    Ok(false) => {
+                                        save_state(&open_positions);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "STALE RECOVERY Polymarket close unconfirmed | token={} error={}",
+                                            token, e
+                                        );
+                                        save_state(&open_positions);
+                                    }
+                                },
+                                Err(e) => {
+                                    alert_close_failure(
+                                        telegram_bot.as_ref(),
+                                        &mut open_positions[j],
+                                        "STALE-RECOVERY",
+                                        e,
+                                    )
+                                    .await;
+                                    save_state(&open_positions);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1717,22 +1876,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 let pos = open_positions[j].clone();
-                if matches!(
-                    pos.state,
-                    PositionState::StopPending
-                        | PositionState::HedgeEvaluating
-                        | PositionState::HedgePending
-                        | PositionState::Hedged
-                        | PositionState::Unwinding
-                        | PositionState::ExpiryHold
-                        | PositionState::Closed
-                        | PositionState::ClosedConfirmed
-                        | PositionState::ExpiredPendingResolution
-                        | PositionState::ResolvedConfirmed
-                        | PositionState::ManualReviewRequired
-                        | PositionState::EntryUnknownPendingReconcile
-                ) && !pos.is_hedge
-                {
+                if should_skip_position_management(&pos) {
                     j += 1;
                     continue;
                 }
@@ -1740,11 +1884,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // ── STOP-FAILED ESCALATING RETRY ──────────────────────────────
                 // Positions stuck in StopFailed are retried every tick with
                 // increasing aggression so they NEVER bleed to zero silently.
-                if matches!(
-                    pos.state,
-                    PositionState::RecoveryPending | PositionState::ExitFailedZeroFill
-                ) && !pos.is_hedge
-                {
+                if is_recoverable_exit_state(&pos.state) && !pos.is_hedge {
                     // Count how many times we have already failed by inspecting last_error.
                     let fail_count = pos
                         .last_error
@@ -2313,17 +2453,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 e,
                             )
                             .await;
-                            let allow_cross_venue_hedge =
-                                match config::cross_venue_hedge_enabled(startup.live_mode) {
-                                    Ok(enabled) => enabled,
-                                    Err(config_error) => {
-                                        warn!(
-                                            "Cross-venue hedge disabled by invalid config | error={}",
-                                            config_error
-                                        );
-                                        false
-                                    }
-                                };
+                            let allow_cross_venue_hedge = match config::cross_venue_hedge_enabled(
+                                startup.live_mode,
+                            ) {
+                                Ok(enabled) => enabled,
+                                Err(config_error) => {
+                                    warn!(
+                                        "Cross-venue hedge disabled by invalid config | error={}",
+                                        config_error
+                                    );
+                                    false
+                                }
+                            };
                             let sl_liquidity_threshold = env_f64("SL_LIQUIDITY_THRESHOLD", 0.23);
                             if allow_cross_venue_hedge && stop_ref <= sl_liquidity_threshold {
                                 let seconds_to_expiry = (900 - elapsed_secs).max(0) as i64;
